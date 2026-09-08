@@ -46,8 +46,8 @@ Open `.env` in any text editor and add your Gemini API key:
 
 ```env
 GEMINI_API_KEY=your_gemini_api_key_here
-GEMINI_EXTRACTION_MODEL=gemini-2.5-flash
-GEMINI_REASONING_MODEL=gemini-2.5-flash
+GEMINI_EXTRACTION_MODEL=gemini-3.5-flash
+GEMINI_REASONING_MODEL=gemini-3.5-flash
 ```
 
 Start the backend server:
