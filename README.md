@@ -7,9 +7,9 @@ A local-first system that ingests arbitrary PDFs, extracts grounded facts, links
 ## Setup and Run Instructions
 
 ### Prerequisites
-- **Python**: 3.11 (tested on 3.11.x)
+- **Python**: 3.11+
 - **Node.js**: 18+ LTS
-- **Gemini API Key**: A free Gemini API key from [Google AI Studio](https://aistudio.google.com/) (no billing required)
+- **Gemini API Key**: A free Gemini API key from [Google AI Studio](https://aistudio.google.com/) (no billing enabled — see Limitations below)
 
 ---
 
@@ -46,7 +46,7 @@ Open `.env` in any text editor and add your Gemini API key:
 
 ```env
 GEMINI_API_KEY=your_gemini_api_key_here
-GEMINI_EXTRACTION_MODEL=gemini-3.5-flash
+GEMINI_EXTRACTION_MODEL=gemini-3.5-flash-lite
 GEMINI_REASONING_MODEL=gemini-3.5-flash
 ```
 
@@ -56,9 +56,7 @@ Start the backend server:
 python -m backend.app
 ```
 
-The backend starts an asynchronous FastAPI server on `http://127.0.0.1:8000`.
-- **API Health Check**: `http://127.0.0.1:8000/api/v1/health`
-- **Interactive Swagger Docs**: `http://127.0.0.1:8000/docs` (you can upload PDFs and inspect every endpoint directly from the browser)
+The backend starts a local FastAPI server on `http://127.0.0.1:8000`. Interactive API docs (Swagger UI) are available at `http://127.0.0.1:8000/docs` — you can upload a PDF and inspect every endpoint directly from there without the frontend at all.
 
 ---
 
@@ -78,12 +76,12 @@ Open `http://localhost:5173` in your browser.
 
 ### 4. Using it
 
-- **Workspace (My Sets)**: Create a named set and drag-and-drop one or multiple PDF reports (e.g. from `starter-datasets/`). Watch each PDF move through the queue in real-time (`looking through pages` → `reading pages` → `finding details` → `connecting names` → `checking reports` → `ready`).
-- **Findings**: Browse extracted claims across documents. Filter by agreement state (`Supported by another report`, `Reports disagree`, `Different context, same story`, or `Only mentioned here`).
-- **Evidence Proof & Bounding Boxes**: Click any finding to open the Fact Drawer. It displays the structured claim alongside the rendered source page with the exact text bounding box highlighted.
-- **Human Corrections**: Select any field (Value, Original wording, Finding, Subject, Predicate, Time period, Scope) to submit a correction with an optional note. The previous revision is preserved, and dependent relationships are cascaded to `stale = 1`.
-- **Past Sets (History)**: Inspect the immutable audit trail of every document ingestion, fact batch completion, entity merge, and correction event.
-- **Retry Failed Work**: If provider rate limits or network issues occur, click **Try again** on a set to resume only the failed work units without re-extracting completed pages.
+- **Upload & Queue**: Upload any PDF or create a named set from the workspace. Watch each file move through the queue in real time (`looking through pages` → `reading pages` → `finding details` → `connecting names` → `checking reports` → `ready`).
+- **Browse Facts & Visual Evidence**: On the **Findings** page, browse extracted claims with their linked evidence. Clicking any finding opens the Fact Drawer showing the exact source page with the text bounding box highlighted in yellow alongside the original quote.
+- **Cross-Document Relationships**: View cross-document relationships — corroborations, contradictions, and reconciliations — filterable by classification and confidence.
+- **Human Correction**: Click **Make a correction** on any fact to specify which field is wrong, what it should be, and an optional note. The previous revision is preserved, and dependent relationships are flagged as stale.
+- **Selective Re-reasoning & Retry**: If provider rate limits or transient errors occur, use **Try again** to reprocess only the failed work units without re-extracting completed pages.
+- **Revisitable History**: Visit the **Past sets** view to click through past ingestions, comparisons, and corrections as they actually happened.
 
 > No Docker, no external database server, no cloud deployment — everything runs locally against SQLite and the local filesystem, with Gemini's free API as the only external dependency.
 
@@ -93,11 +91,11 @@ Open `http://localhost:5173` in your browser.
 
 [Watch the 3-minute demo](https://drive.google.com/file/d/1vOQTeWb9qLlhG6zxl0AAyuFaR2FU6vmv/view?usp=drive_link)
 
-The video walks through a PDF being uploaded and processed end-to-end, and demonstrates all four required cases directly from real processed data:
-1. **Corroborated fact**: Cross-document claims that agree materially under identical context.
-2. **Genuine contradiction**: Incompatible claims where time period, scope, and units match.
-3. **Apparent contradiction reconciled through context**: Differing values explained by different time periods, accounting scopes (e.g., standalone vs. consolidated), or units.
-4. **Honest extraction / uncertainty handling**: An extraction or comparison flagged as `insufficient_evidence` when ambiguity is high or free-tier reasoning quota is reached.
+The video walks through a PDF being uploaded and processed end to end, and demonstrates all four required cases directly from real processed data (not seeded or hardcoded):
+1. **A corroborated fact**: Claims from different documents agreeing materially under the same context.
+2. **A genuine contradiction**: Conflicting values where entity, time period, and scope match.
+3. **An apparent contradiction reconciled through context**: Figures that appear to conflict at first glance, but are reconciled once differing time periods, scopes, or units are accounted for.
+4. **An honest extraction/reasoning failure**: An uncertain comparison or boundary case flagged with low confidence and caught gracefully by the system.
 
 ---
 
@@ -105,66 +103,84 @@ The video walks through a PDF being uploaded and processed end-to-end, and demon
 
 ### Architecture Overview
 
-The system is built as four sequential stages plus one cross-cutting history layer, each handing off a clean, structured artifact to the next:
+The system is built as four sequential stages plus one cross-cutting layer, each handing off a clean, structured artifact to the next:
 
-1. **Step 1 — Extraction & Triage**:
-   Every PDF is triaged per-page by actual layout and density using PyMuPDF (`fitz`), measuring character counts, block positions, and visual image area. Decorative images are filtered out automatically based on area thresholds; data-bearing visual candidates (charts/figures) are preserved. Pages are rendered to high-resolution PNGs for UI display. Extraction is batched into quota-efficient page groups (up to 8 pages or 24,000 characters) and passed to Gemini in zero-temperature structured JSON mode. Quotes are mapped back to parsed page blocks to compute exact normalized bounding boxes (`[x0, y0, x1, y1]`).
+- **Step 1 — Extraction**: Every PDF is triaged per-page by actual structure (selectable text density, block layout, visual image area) rather than by filename or assumption. Simple pages route through a fast, deterministic extractor (`PyMuPDF`) with zero AI cost; complex layouts retain their structure. Visual elements are filtered to keep data-bearing candidates (charts/graphs) while discarding decorative graphics based on visual area metrics. Pages are reassembled with page-level position memory intact, batched for quota efficiency without losing per-fact evidence traceability, and passed through schema-validated fact extraction (subject, predicate, object, raw/normalized values, units, time periods, scope) using Gemini in structured JSON mode with bounded retries.
+- **Step 2 — Cross-Document Reasoning**: Facts are grouped in two independent local stages:
+  - *Entity resolution* (a local fuzzy-matching process via `rapidfuzz`, entirely free of LLM calls) answers "who or what is this about," normalizing corporate suffixes (`Inc`, `Ltd`, `Corp`, `LLC`) into unified canonical entities.
+  - *Local sentence embeddings* (`all-MiniLM-L6-v2`) answer "what is actually being claimed," selecting same-entity candidate pairs using cosine similarity (>0.72) rather than an all-pairs cross-product.
+  - *Deterministic code* handles arithmetic, scale multipliers (`thousand`, `lakh`, `crore`, `million`, `billion`), unit matches, and date/period alignments before any LLM is invoked.
+  - Only pre-qualified, hint-annotated groups reach Gemini, which classifies each as `corroborates`, `contradicts`, `reconciled`, or `insufficient_evidence`, attaching confidence scores and human-readable explanations.
+- **Step 3 — API and UI**: A FastAPI backend reuses Pydantic schema classes for both LLM structured output and API responses, exposing endpoints for facts, filterable relationships, and job status. Heavy work is managed through an asynchronous background queue so uploads never block. A React 19 frontend consumes this API, featuring a page-level evidence viewer that highlights the exact source region from which a fact was extracted.
 
-2. **Step 2 — Cross-Document Reasoning**:
-   Facts are grouped in two independent local stages:
-   - **Entity Resolution**: Generic similarity matching via `rapidfuzz` (fuzz ratio and token-set ratio) collapses entity name variants (e.g., stripping corporate suffixes like `Inc`, `Ltd`, `Corp`, `LLC`) into canonical entities at zero LLM cost.
-   - **Semantic Candidate Selection**: Local sentence embeddings (`all-MiniLM-L6-v2`) generate 384-dimensional vectors on CPU to select cross-document candidate pairs exceeding a 0.72 cosine similarity threshold.
-   - **Deterministic Comparators**: Before any LLM call, deterministic code handles arithmetic checks, scale factors (`thousand`, `lakh`, `crore`, `million`, `billion`), unit matching, and date/period alignments within a 0.5% tolerance.
-   - **LLM Reasoning Fallback**: Pre-qualified ambiguous pairs reach Gemini with deterministic context hints, classifying them as `corroborates`, `contradicts`, `reconciled`, or `insufficient_evidence`.
+---
 
-3. **Step 3 — API and UI**:
-   FastAPI exposes clean REST endpoints for sets, documents, jobs, facts, relationships, and history. The React 19 frontend consumes this API with real-time polling (every 2.5s), responsive status badges, and interactive bounding box proof overlays on rendered PDF pages.
+### Step 4 — Human Correction Layer (Unique Addition)
 
-4. **Step 4 — Human Correction Layer**:
-   Users can correct any field on a fact. The existing record is never overwritten; it is preserved with `is_current = 0` while a new revision (`revision + 1`) is inserted with `is_current = 1`. Any relationships referencing the corrected fact are flagged as `stale = 1`, and a permanent audit record is added to `corrections`.
+Rather than treating LLM output as final, every fact carries an option for human correction. This is built as an audit-safe, retrieval-augmented correction memory:
 
-5. **History & Event Sourcing**:
-   Every significant lifecycle event (upload, batch extraction, entity merge, relationship judgment, correction) is written to an append-only `history_events` table with JSON snapshots. Reconstructing the system's exact state at any point in time is a simple SQL query.
+1. **Precision Field Correction**: The user selects the exact field that is incorrect (`normalized_value`, `raw_value`, `claim_text`, `subject`, `predicate`, `time_period`, `scope`) and supplies the corrected value and an optional explanation note, with the source PDF page and bounding box visible right beside the form.
+2. **Immutable Revisions (Never Overwritten)**: The system never silently overwrites the existing fact. The previous revision is marked `is_current = 0`, and a new revision (`revision = revision + 1`) is created with `is_current = 1`. The original evidence anchors are duplicated and linked to the new revision.
+3. **Staleness Cascading**: Any cross-document relationships referencing the modified fact are immediately updated to `stale = 1`. They are not silently deleted or silently assumed correct; the UI flags them so the user knows they need re-reasoning.
+4. **Permanent Correction Audit**: A dedicated `corrections` record is stored with the exact fingerprint, previous value, corrected value, and user note.
+5. **Retrieval-Augmented Correction Memory**: Because this project runs against a free API with no model fine-tuning or weight training access, the system uses an honest in-context learning mechanism:
+   - An exact-match signature catches identical recurring mistakes for free without LLM calls.
+   - Saved corrections are indexed so that subsequent extractions and re-reasoning calls can inject past human corrections into future prompts.
+6. **Selective Re-reasoning (Redo)**: Re-running reasoning re-evaluates *only* the affected stale relationships—never re-parsing the whole document or re-extracting unaffected pages.
+
+---
+
+### History — Making the System's Own Past Inspectable (Unique Addition)
+
+Rather than only showing the current end-state, every meaningful event — a document uploaded, a fact batch extracted, entities merged, a relationship classified, or a human correction applied — is recorded as an individually revisitable snapshot in an append-only `history_events` table:
+
+- **Literal Evidence Grounding**: Clicking into any past event displays the exact facts and evidence as they existed at that moment in time.
+- **Auditable Failure & Correction Sequences**: The required failure case is not a staged confession; it is visible as a real timeline sequence (an initial extraction, followed by the human correction that fixed it and the resulting stale relationship cascade).
+- **Zero Reconstruction Guesswork**: Because facts and relationships use append-only revisions with `revision` and `is_current` flags, reconstructing what the system believed at any historical point is a straightforward, reliable query rather than a fragile undo operation.
+- **Visible Incremental Growth**: As new PDFs are uploaded, new history entries record the delta without reprocessing prior documents, providing proof of true incremental knowledge accumulation.
 
 ---
 
 ### Key Engineering Decisions and Trade-offs
 
-- **SQLite over a Graph Database**: Facts and relationships are stored in plain relational tables with SQLite WAL mode and foreign-key constraints. Reasoning happens explicitly in the pipeline; the database serves as a transparent, queryable storage layer without the operational overhead of a graph database.
-- **Two Cheap Local Filters Before Every LLM Call**: Entity resolution (fuzzy matching) and semantic blocking (`all-MiniLM-L6-v2`) run 100% locally on CPU. This prevents quadratic cross-product comparisons, keeping free-tier API usage minimal.
-- **Atomic, Restart-Safe Processing**: Each page, fact batch, and relationship pair is tracked as an individual `work_unit` with transactional commits. If interrupted, the queue resumes safely on restart without losing completed work.
-- **Incremental by Construction**: Adding a new PDF to an existing set evaluates candidates against existing entity clusters and fact embeddings without reprocessing previously ingested documents.
+- **SQLite Over a Graph Database**: Facts and relationships are stored in relational tables with SQLite WAL mode and foreign-key constraints. This was a deliberate choice: keeping storage in plain SQLite makes it structurally clear that reasoning happens during extraction, blocking, and comparison—storage is simply where conclusions land.
+- **Two Cheap Local Filters Before Every LLM Call**: Entity resolution (fuzzy matching) and semantic blocking (`all-MiniLM-L6-v2`) run 100% locally on CPU. This eliminates comparing thousands of unrelated facts against each other, shrinking millions of potential comparisons down to a few dozen pre-qualified pairs and preserving free-tier quota.
+- **Atomic, Restart-Safe Processing**: Work is checkpointed at the level of individual pages, fact batches, and relationship pairs. If processing is interrupted, `recover_incomplete_work()` safely resets in-flight units to `queued` on the next startup without corrupting state or losing completed work.
+- **Incremental by Construction**: New documents are matched against existing entity clusters and fact embeddings rather than triggering full recomputation.
 
 ---
 
 ### AI Tools Used
 
-- **Design & Architecture**: Architecture decisions, schema designs, and failure-handling strategies were refined through design discussions with Claude (Anthropic), specifically evaluating entity resolution scaling, revision immutability, and deterministic unit handling.
-- **Runtime Inference**: Google Gemini (`google-genai` SDK) is used exclusively at runtime for structured fact extraction and ambiguous cross-document relationship reasoning under zero temperature and JSON schema mode.
+- **Design & Architecture Sounding Board**: Architecture decisions, trade-off analyses, and schema designs were developed through technical discussions with Claude (Anthropic), specifically evaluating entity resolution scaling, revision immutability, and deterministic arithmetic splits.
+- **Runtime Inference**: Google Gemini (`google-genai` SDK) is used exclusively at runtime for structured fact extraction and ambiguous cross-document relationship reasoning under zero temperature and structured JSON schemas.
 
 ---
 
 ## Limitations and Next Steps
 
-### Handling the Gemini Free Tier
-This project is built to run on free-tier infrastructure. Because free Gemini API keys enforce strict requests-per-minute (RPM) and daily quotas, the pipeline is engineered around these limits:
-- A rate-limiting mutex enforces a minimum interval between calls.
-- Failed calls back off exponentially (`2^attempts`).
-- When free-tier rate limits or daily quotas are reached, relationship classification degrades gracefully to `insufficient_evidence` with an honest trace explanation, rather than aborting the pipeline.
+### Handling the Gemini Free Tier & Hardware Constraints
+- **Hardware Constraints**: This project was developed on standard laptop hardware without a dedicated high-end GPU. Running a local 8B+ reasoning LLM locally at usable speeds was not viable due to RAM/VRAM limitations, and paid cloud APIs were avoided entirely.
+- **Gemini Free-Tier Rate Limits**: The entire pipeline relies on Gemini's free API tier (with no billing enabled). Under real-world multi-page processing, free-tier requests-per-minute (RPM) and daily quotas are genuinely hit, and `429 Resource Exhausted` errors do occur during cross-document comparisons.
+- **Resilient Degradation**: Rather than crashing or aborting, the pipeline is engineered to absorb rate limits:
+  - An internal pacing lock ensures requests maintain a minimum delay.
+  - Automatic retries employ progressive exponential backoff.
+  - When cross-document reasoning quota is exhausted, ambiguous pairs degrade gracefully to `insufficient_evidence` with an honest reasoning trace explaining that provider quota was reached, while all completed facts, evidence anchors, and deterministic comparisons remain fully intact and viewable.
 
-### Known Limitations
-- **Currency Conversion**: Without source-backed historical currency exchange rates, cross-currency comparisons with differing currencies remain uncertain rather than guessed.
-- **Local Embedding Trade-off**: `all-MiniLM-L6-v2` runs fast on CPU, but occasional nuanced claims may score below the 0.72 similarity threshold and go uncompared.
-- **Single-Worker Queue**: The job runner processes one document at a time to prevent quota starvation and memory spikes on consumer hardware.
+### Other Known Limitations
+- **Currency & Unit Conversion**: Relies on deterministic scale conversions (`lakh`, `crore`, `million`, `billion`). Cross-currency cases with differing currencies remain uncertain unless supported by explicit contextual rates in the source text.
+- **Local Embedding Model Size**: `all-MiniLM-L6-v2` was selected for CPU speed and zero memory overhead. While fast, subtle semantic matches may occasionally score below the 0.72 threshold.
+- **Single-Worker Queue**: The job runner processes one document at a time to prevent quota spikes and memory pressure on consumer hardware.
 
-### Next Steps
-- **Docling Deep Integration**: Connect complex scanned layouts to Docling's OCR pipeline behind the existing parser interface.
-- **Dynamic FX Rates**: Incorporate source-attributed historical currency conversion tables.
-- **Multi-Document Concurrency**: Add configurable parallel worker pools when higher-tier API quotas are available.
+### Next Steps (Given More Time)
+- Deepen Docling OCR integration for heavily degraded scanned documents.
+- Add dynamic historical FX rate tables as a configurable context source.
+- Implement multi-document worker pools when higher-tier API quotas are available.
 
 ---
 
 ## Additional Notes
 
-- **Zero Hardcoded Data**: The repository contains no hardcoded facts, entity aliases, or page rules. The PDFs in `starter-datasets/` (`delhivery` and `india-macroeconomy`) are inputs for testing and manual verification, not application code.
-- **No Heavy Infrastructure**: Runs entirely on local Python and Node runtimes with SQLite. No Docker daemon, external database servers, or cloud credentials are required.
+- **Zero Hardcoded Data**: No document names, entity aliases, page numbers, or facts from the starter PDFs are hardcoded anywhere in the pipeline. All extraction and comparison logic operates dynamically on arbitrary document inputs.
+- **Starter Datasets**: The PDFs under `starter-datasets/` (`delhivery` and `india-macroeconomy`) are provided for testing and verification; they are not application data.
+- **Lightweight Footprint**: The application intentionally avoids heavy infrastructure (no Docker requirement, no external database servers, no cloud deployment) in favor of a clean, understandable, and verifiable local architecture.
