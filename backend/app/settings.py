@@ -42,6 +42,7 @@ class Settings(BaseSettings):
     relationship_gemini_call_budget: int = Field(
         default=8, validation_alias="FACTUALIZE_RELATIONSHIP_GEMINI_CALL_BUDGET"
     )
+    gemini_daily_request_budget: int = Field(default=15, ge=1, validation_alias="FACTUALIZE_GEMINI_DAILY_REQUEST_BUDGET")
 
     @property
     def database_path(self) -> Path:
@@ -58,6 +59,11 @@ class Settings(BaseSettings):
     @property
     def renders_dir(self) -> Path:
         return self.data_dir / "renders"
+
+    @property
+    def docling_models_dir(self) -> Path:
+        """Local, copy-based Docling artifacts for Windows-safe first use."""
+        return self.cache_dir / "docling-models"
 
     def ensure_directories(self) -> None:
         for path in (self.data_dir, self.documents_dir, self.cache_dir, self.renders_dir):

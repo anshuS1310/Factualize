@@ -90,7 +90,7 @@ export interface FactSummary {
   set_id: string | null;
   is_current: boolean;
   correction_state: string;
-  cross_check_status: "corroborated" | "reconciled" | "contradicted" | "insufficient_evidence" | "no_comparable_source";
+  cross_check_status: "stale" | "corroborated" | "reconciled" | "contradicted" | "insufficient_evidence" | "no_comparable_source";
   cross_check_explanation: string;
   cross_check_source_count: number;
 }
@@ -212,11 +212,26 @@ export function listRelationships(setId: string): Promise<RelationshipSummary[]>
   return request<RelationshipSummary[]>(`/relationships?set_id=${encodeURIComponent(setId)}`);
 }
 
-export function listHistory(setId?: string): Promise<HistoryEvent[]> {
-  const query = setId ? `?set_id=${encodeURIComponent(setId)}` : "";
+export function listHistory(setId?: string, limit = 100): Promise<HistoryEvent[]> {
+  const params = new URLSearchParams({ limit: String(limit) });
+  if (setId) params.set("set_id", setId);
+  const query = `?${params.toString()}`;
   return request<HistoryEvent[]>(`/history${query}`);
 }
 
 export function pageRenderUrl(documentId: string, pageNumber: number): string {
   return `${API_BASE}/documents/${documentId}/pages/${pageNumber}/render`;
+}
+
+export interface RelationshipDetail {
+  relationship: RelationshipSummary;
+  left: FactDetail;
+  right: FactDetail;
+  revisions: RelationshipSummary[];
+  reasoning_trace: Record<string, unknown>;
+}
+export function getRelationship(id: string): Promise<RelationshipDetail> { return request(`/relationships/${id}`); }
+export function recheckRelationship(id: string): Promise<RelationshipSummary> { return request(`/relationships/${id}/recheck`, {method: "POST"}); }
+export function correctRelationship(id: string, label: RelationshipSummary["label"], note: string): Promise<RelationshipSummary> {
+  return request(`/relationships/${id}/corrections`, {method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify({label, note})});
 }

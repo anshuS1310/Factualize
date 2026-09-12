@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any
 
 from .database import Database
+from .correction_memory import CorrectionMemory
 from .errors import ProcessingStopped
 from .gemini import ExtractionPage, GeminiConfigurationError, GeminiExtractionError, GeminiGateway
 from .schemas import PipelineStage, WorkUnitStatus
@@ -65,7 +66,7 @@ class FactExtractionService:
                     document_id=document["id"],
                     set_id=set_id,
                     batch_key=batch_key,
-                    facts=cached_facts,
+                    facts=CorrectionMemory(self.database).apply_facts(cached_facts),
                     page_ids=page_ids,
                     cache_path=str(cache_path),
                 )
@@ -95,7 +96,7 @@ class FactExtractionService:
                         document_id=document["id"],
                         set_id=set_id,
                         batch_key=batch_key,
-                        facts=prepared,
+                        facts=CorrectionMemory(self.database).apply_facts(prepared),
                         page_ids=page_ids,
                         cache_path=str(cache_path),
                     )
@@ -105,7 +106,7 @@ class FactExtractionService:
                     raise
                 except GeminiExtractionError as error:
                     unit = self.database.get_work_unit(unit["id"]) or unit
-                    if int(unit["attempts"]) >= self.settings.gemini_max_automatic_attempts:
+                    if "quota" in str(error).casefold() or "429" in str(error) or int(unit["attempts"]) >= self.settings.gemini_max_automatic_attempts:
                         self.database.update_work_unit(
                             unit["id"],
                             status=WorkUnitStatus.RETRYABLE_FAILED,

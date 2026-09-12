@@ -33,6 +33,7 @@ from .schemas import (
     JobProgress,
     PageSummary,
     RelationshipSummary,
+    RelationshipCorrectionRequest,
     SetDocumentMember,
     SetUploadResponse,
     UploadResponse,
@@ -173,7 +174,9 @@ def document_set_detail_response(database: Database, document_set: dict[str, Any
                 },
             )
         members.append(SetDocumentMember(document=document_response(row), job=job, position=int(row["position"])))
-    return DocumentSetDetail(**document_set_response(document_set).model_dump(), documents=members)
+    summary = document_set_response(document_set).model_dump()
+    summary["document_count"] = len(members)
+    return DocumentSetDetail(**summary, documents=members)
 
 
 @asynccontextmanager
@@ -182,7 +185,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     database = Database(settings.database_path)
     database.initialize()
     storage = LocalDocumentStorage(settings)
-    gateway = GeminiGateway(settings)
+    gateway = GeminiGateway(settings, database)
     fact_extraction = FactExtractionService(settings, database, gateway)
     entity_resolution = EntityResolutionService(database)
     relationship_service = RelationshipService(settings, database, gateway)
@@ -199,6 +202,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.database = database
     app.state.storage = storage
     app.state.runner = runner
+    app.state.relationship_service = relationship_service
     await runner.start()
     try:
         yield
@@ -493,14 +497,46 @@ def list_relationships(
 
 
 @app.get("/api/v1/demonstration/{label}", response_model=RelationshipSummary)
-def demonstration_case(request: Request, label: str) -> RelationshipSummary:
-    relationships = get_database(request).list_relationships(label=label, stale=False)
+def demonstration_case(request: Request, label: str, set_id: str) -> RelationshipSummary:
+    relationships = get_database(request).list_relationships(label=label, stale=False, set_id=set_id)
     if not relationships:
         raise HTTPException(
             status_code=404,
             detail="No real stored example exists for this category yet; none has been manufactured.",
         )
     return relationship_response(relationships[0])
+
+
+@app.get("/api/v1/relationships/{relationship_id}")
+def relationship_detail(request: Request, relationship_id: str):
+    database = get_database(request)
+    with database.connection() as conn:
+        row = conn.execute("SELECT * FROM relationships WHERE id=?", (relationship_id,)).fetchone()
+        if not row:
+            raise HTTPException(404, "Comparison not found.")
+        revisions = conn.execute("SELECT * FROM relationships WHERE stable_id=? ORDER BY revision DESC", (row["stable_id"],)).fetchall()
+    return {"relationship": relationship_response(dict(row)), "left": fact_response(database, database.get_fact(row["left_fact_id"]), detail=True), "right": fact_response(database, database.get_fact(row["right_fact_id"]), detail=True), "revisions": [relationship_response(dict(item)) for item in revisions], "reasoning_trace": parse_json(row["reasoning_trace_json"], {})}
+
+
+@app.post("/api/v1/relationships/{relationship_id}/recheck", response_model=RelationshipSummary)
+def recheck_relationship(request: Request, relationship_id: str):
+    return revise_relationship(request, relationship_id)
+
+
+@app.post("/api/v1/relationships/{relationship_id}/corrections", response_model=RelationshipSummary)
+def correct_relationship(request: Request, relationship_id: str, correction: RelationshipCorrectionRequest):
+    return revise_relationship(request, relationship_id, label=correction.label.value, note=correction.note)
+
+
+def revise_relationship(request: Request, relationship_id: str, **kwargs):
+    try:
+        return relationship_response(request.app.state.relationship_service.revise(relationship_id, **kwargs))
+    except KeyError as error:
+        raise HTTPException(404, "Current comparison not found.") from error
+    except ValueError as error:
+        raise HTTPException(409, str(error)) from error
+    except RuntimeError as error:
+        raise HTTPException(503, str(error)) from error
 
 
 @app.get("/api/v1/history", response_model=list[HistoryEventResponse])

@@ -198,6 +198,11 @@ class RelationshipSummary(BaseModel):
     set_id: str | None = None
 
 
+class RelationshipCorrectionRequest(BaseModel):
+    label: RelationshipLabel
+    note: str = Field(min_length=10, max_length=2000)
+
+
 class HistoryEventResponse(BaseModel):
     id: str
     event_type: str

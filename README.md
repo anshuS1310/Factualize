@@ -1,17 +1,17 @@
 # Factualize
 
-A local-first system that ingests arbitrary PDFs, extracts grounded facts, links every fact back to its exact source evidence, and reasons across documents to determine whether facts **corroborate**, **contradict**, or can be **reconciled through context** — with a human correction layer and a full, revisitable history of how the system arrived at every conclusion.
+A local PDF review prototype that extracts source-linked facts from named PDF sets, compares claims across documents, and keeps human corrections and earlier conclusions available for inspection. Results are evidence-backed claims, not a guarantee of real-world truth.
 
 ---
 
 ## Setup and Run Instructions
 
 ### Prerequisites
-- **Python**: 3.11+
-- **Node.js**: 18+ LTS
-- **Gemini API Key**: A free Gemini API key from [Google AI Studio](https://aistudio.google.com/) (no billing enabled — see Limitations below)
 
----
+- Python **3.11** (the package currently requires >=3.11,<3.12).
+- Node.js compatible with Vite 7 (20.19+ or 22.12+); development has also used Node 24.
+- A Gemini API key and model IDs enabled for your account. This project cannot establish your account's quota or billing status.
+- Internet for initial Docling/OCR/embedding model downloads and Gemini calls. CPU processing of complex PDFs may be slow.
 
 ### 1. Clone the repository
 
@@ -20,82 +20,85 @@ git clone https://github.com/anshuS1310/Factualize.git
 cd Factualize
 ```
 
----
-
 ### 2. Backend setup
 
-From the repository root:
+Windows PowerShell:
 
-**Linux / macOS:**
-```bash
-python3.11 -m venv .venv
-source .venv/bin/activate
-pip install -e ".[dev]"
-cp .env.example .env
-```
-
-**Windows PowerShell:**
 ```powershell
-python -m venv .venv
+py -3.11 -m venv .venv
 .\.venv\Scripts\Activate.ps1
-pip install -e ".[dev]"
+python -m pip install -e ".[dev]"
 Copy-Item .env.example .env
 ```
 
-Open `.env` in any text editor and add your Gemini API key:
+Linux / macOS:
 
-```env
-GEMINI_API_KEY=your_gemini_api_key_here
-GEMINI_EXTRACTION_MODEL=gemini-3.5-flash-lite
-GEMINI_REASONING_MODEL=gemini-3.5-flash
+```bash
+python3.11 -m venv .venv
+source .venv/bin/activate
+python -m pip install -e ".[dev]"
+cp .env.example .env
 ```
 
-Start the backend server:
+For an existing installation, keep your existing `.env`; run the install command again to pick up dependencies. Never overwrite your settings with the template during an upgrade.
+
+Set these values in `.env`, using actual model IDs available to your account:
+
+```env
+GEMINI_API_KEY=your_key_here
+GEMINI_EXTRACTION_MODEL=your_available_extraction_model
+GEMINI_REASONING_MODEL=your_available_reasoning_model
+FACTUALIZE_GEMINI_MIN_INTERVAL_SECONDS=4
+FACTUALIZE_GEMINI_DAILY_REQUEST_BUDGET=15
+FACTUALIZE_RELATIONSHIP_GEMINI_CALL_BUDGET=8
+```
+
+The 15-request limit is a conservative **local ceiling**, not a statement about Google's allowance. It counts attempted calls across both tasks in SQLite by UTC day and survives restarts and key changes. A provider quota error starts a one-hour local cooldown. Adjust the ceiling to your actual allowance; retry only when quota is available. Key changes require a backend restart.
+
+Optional, before uploading a scan, table-heavy, or multi-column PDF, prefetch the local Docling/OCR models once (this does not use Gemini):
+
+```powershell
+python -m backend.app.prefetch_docling
+```
 
 ```powershell
 python -m backend.app
 ```
 
-The backend starts a local FastAPI server on `http://127.0.0.1:8000`. Interactive API docs (Swagger UI) are available at `http://127.0.0.1:8000/docs` — you can upload a PDF and inspect every endpoint directly from there without the frontend at all.
-
----
+Backend: `http://127.0.0.1:8000`. Interactive API documentation: `http://127.0.0.1:8000/docs`.
 
 ### 3. Frontend setup
 
-In a second terminal:
+In another terminal:
 
 ```powershell
 cd frontend
 npm install
-npm run dev
+npm run dev -- --host 127.0.0.1
 ```
 
-Open `http://localhost:5173` in your browser.
-
----
+Open `http://127.0.0.1:5173`. Explicitly binding the address avoids the Windows IPv4/IPv6 localhost mismatch.
 
 ### 4. Using it
 
-- **Upload & Queue**: Upload any PDF or create a named set from the workspace. Watch each file move through the queue in real time (`looking through pages` → `reading pages` → `finding details` → `connecting names` → `checking reports` → `ready`).
-- **Browse Facts & Visual Evidence**: On the **Findings** page, browse extracted claims with their linked evidence. Clicking any finding opens the Fact Drawer showing the exact source page with the text bounding box highlighted in yellow alongside the original quote.
-- **Cross-Document Relationships**: View cross-document relationships — corroborations, contradictions, and reconciliations — filterable by classification and confidence.
-- **Human Correction**: Click **Make a correction** on any fact to specify which field is wrong, what it should be, and an optional note. The previous revision is preserved, and dependent relationships are flagged as stale.
-- **Selective Re-reasoning & Retry**: If provider rate limits or transient errors occur, use **Try again** to reprocess only the failed work units without re-extracting completed pages.
-- **Revisitable History**: Visit the **Past sets** view to click through past ingestions, comparisons, and corrections as they actually happened.
+1. Create a named set of one or more related PDFs. One document runs at a time; the others wait in the queue.
+2. Open **Findings** to inspect claims and their source pages. A source quote is preserved; a rectangle is shown only when available.
+3. Open **Comparisons** to inspect agreement, disagreement, reconciliation and uncertainty. The demonstration cards select real current examples in the selected set. An empty category explicitly says no example exists.
+4. Open a comparison to inspect both original fact revisions and quotes. Review older conclusions using **Previous conclusions**.
+5. Correct a fact from its source drawer. Dependent conclusions become stale. In **Comparisons**, filter **Needs recheck** and click **Recheck current sources**. Rechecking creates a new conclusion revision using current fact revisions; a failed call leaves the earlier stale conclusion intact.
+6. If the facts are right but their classification is wrong, use **Correct this conclusion** and provide a reason. Review stale sources first. Corrections are stored locally for reuse across later sets.
+7. Use **History of PDFs** to reopen sets and **Activity & corrections** for the selected set's recorded events. Expand an event to read its snapshot and open linked fact revisions where available.
+8. Pause processing between work units; retry failed work when available. Remove a report or delete a set after stopping active work. A shared source file is kept while another set references it.
 
-> No Docker, no external database server, no cloud deployment — everything runs locally against SQLite and the local filesystem, with Gemini's free API as the only external dependency.
+No Docker, Redis, database server or FAISS is required. Uploaded PDF content is sent to Gemini for extraction/reasoning; “local” describes storage and orchestration, not offline inference.
 
 ---
 
 ## Video Demo
 
-[Watch the 3-minute demo](https://drive.google.com/file/d/1vOQTeWb9qLlhG6zxl0AAyuFaR2FU6vmv/view?usp=drive_link)
+[Existing demo recording](https://drive.google.com/file/d/1vOQTeWb9qLlhG6zxl0AAyuFaR2FU6vmv/view?usp=drive_link)
 
-The video walks through a PDF being uploaded and processed end to end, and demonstrates all four required cases directly from real processed data (not seeded or hardcoded):
-1. **A corroborated fact**: Claims from different documents agreeing materially under the same context.
-2. **A genuine contradiction**: Conflicting values where entity, time period, and scope match.
-3. **An apparent contradiction reconciled through context**: Figures that appear to conflict at first glance, but are reconciled once differing time periods, scopes, or units are accounted for.
-4. **An honest extraction/reasoning failure**: An uncertain comparison or boundary case flagged with low confidence and caught gracefully by the system.
+This link is retained from the previous README; its contents have not been verified against this revision. Record a new walkthrough before submission. Show a real agreement, disagreement, contextual reconciliation and uncertain or failed case if the selected data produces them. Never substitute test fixtures for live demonstration data. A missing category is a visible limitation, not a reason to manufacture a claim.
 
 ---
 
@@ -103,84 +106,69 @@ The video walks through a PDF being uploaded and processed end to end, and demon
 
 ### Architecture Overview
 
-The system is built as four sequential stages plus one cross-cutting layer, each handing off a clean, structured artifact to the next:
+- **Step 1 - Extraction:** PyMuPDF inspects pages. Simple pages keep the native text path. Complex pages (including detected tables, image-heavy/scanned pages and likely multiple columns) use a lazy Docling adapter with RapidOCR and table structure recognition. On first use, the necessary layout, table and English OCR artifacts are copied into `data/cache/docling-models`; this avoids Windows symlink-permission failures and is reused thereafter. Markdown preserves reading order and table layout; typed page artifacts also retain table cells, blocks, coordinates and page numbers. A failed complex conversion is a visible failed page, not a silent native-text fallback. See [Docling's pipeline options](https://docling-project.github.io/docling/reference/pipeline_options/).
+- **Fact extraction:** Pages are batched for Gemini JSON-mode extraction and validated locally with Pydantic. Returned quotes and page numbers must match the submitted page text. Evidence rectangles are grounded in matching blocks where possible; a model rectangle is not trusted as text grounding. Text-recognized chart labels may produce facts, but this does not reconstruct a chart's visual relationships.
+- **Step 2 - Comparison:** RapidFuzz resolves names locally. Local sentence embeddings normally propose same-entity pairs from different PDFs in the same set. If that optional model cannot initialise (for example, a first offline run), conservative lexical similarity keeps candidate discovery available; it never decides the conclusion. Numeric code handles a conservative subset with matching metric, period, scope and unit. Missing/different context requires further reasoning rather than automatically proving agreement or reconciliation. Gemini judges ambiguous pairs within the budget. No Splink, DuckDB or FAISS is used or declared as a direct dependency.
+- **Step 3 - API and UI:** FastAPI/Pydantic, SQLite and a single background document runner serve a React/Vite interface. The UI exposes findings, comparisons, both source quotes, stale warnings, correction forms, revisions and event history. No separate relationship database is maintained.
 
-- **Step 1 — Extraction**: Every PDF is triaged per-page by actual structure (selectable text density, block layout, visual image area) rather than by filename or assumption. Simple pages route through a fast, deterministic extractor (`PyMuPDF`) with zero AI cost; complex layouts retain their structure. Visual elements are filtered to keep data-bearing candidates (charts/graphs) while discarding decorative graphics based on visual area metrics. Pages are reassembled with page-level position memory intact, batched for quota efficiency without losing per-fact evidence traceability, and passed through schema-validated fact extraction (subject, predicate, object, raw/normalized values, units, time periods, scope) using Gemini in structured JSON mode with bounded retries.
-- **Step 2 — Cross-Document Reasoning**: Facts are grouped in two independent local stages:
-  - *Entity resolution* (a local fuzzy-matching process via `rapidfuzz`, entirely free of LLM calls) answers "who or what is this about," normalizing corporate suffixes (`Inc`, `Ltd`, `Corp`, `LLC`) into unified canonical entities.
-  - *Local sentence embeddings* (`all-MiniLM-L6-v2`) answer "what is actually being claimed," selecting same-entity candidate pairs using cosine similarity (>0.72) rather than an all-pairs cross-product.
-  - *Deterministic code* handles arithmetic, scale multipliers (`thousand`, `lakh`, `crore`, `million`, `billion`), unit matches, and date/period alignments before any LLM is invoked.
-  - Only pre-qualified, hint-annotated groups reach Gemini, which classifies each as `corroborates`, `contradicts`, `reconciled`, or `insufficient_evidence`, attaching confidence scores and human-readable explanations.
-- **Step 3 — API and UI**: A FastAPI backend reuses Pydantic schema classes for both LLM structured output and API responses, exposing endpoints for facts, filterable relationships, and job status. Heavy work is managed through an asynchronous background queue so uploads never block. A React 19 frontend consumes this API, featuring a page-level evidence viewer that highlights the exact source region from which a fact was extracted.
+### Step 4 - Human Correction Layer (Unique Addition)
 
----
+1. Fact edits append a revision, preserve evidence anchors, invalidate embeddings and mark dependent comparisons stale. Original quote text remains unchanged even when a human corrects an interpretation.
+2. Relationship edits append a revision in the same relationship lineage, mark the old revision non-current, and store the person's label and reason. Stale pairs must be rechecked before a label correction.
+3. Rechecks load the latest revisions of both facts. Persistence checks that the relationship and facts have not changed during reasoning. A failed recheck records an event and does not clear staleness.
+4. The existing `corrections` table is the unified memory for both correction types. Fingerprints contain claim, subject, predicate, values, unit, period, scope and, for fact corrections, the source quote. They exclude document IDs so identical contexts can recur across PDFs.
+5. Exact matches reuse a human field correction or pair judgment locally. Similar contexts retrieve up to five examples from a bounded recent pool for Gemini prompts. Hints do not override new source evidence. Applied fact-memory IDs are retained in qualifiers; relationship reuse is recorded in the reasoning trace.
+6. This is retrieval and in-context guidance, **not model training** and not a guarantee that mistakes will never recur. Changed context prevents automatic exact reuse. Older fact-correction records are upgraded from preserved fact revisions when available.
 
-### Step 4 — Human Correction Layer (Unique Addition)
+### History - Making the System's Own Past Inspectable (Unique Addition)
 
-Rather than treating LLM output as final, every fact carries an option for human correction. This is built as an audit-safe, retrieval-augmented correction memory:
-
-1. **Precision Field Correction**: The user selects the exact field that is incorrect (`normalized_value`, `raw_value`, `claim_text`, `subject`, `predicate`, `time_period`, `scope`) and supplies the corrected value and an optional explanation note, with the source PDF page and bounding box visible right beside the form.
-2. **Immutable Revisions (Never Overwritten)**: The system never silently overwrites the existing fact. The previous revision is marked `is_current = 0`, and a new revision (`revision = revision + 1`) is created with `is_current = 1`. The original evidence anchors are duplicated and linked to the new revision.
-3. **Staleness Cascading**: Any cross-document relationships referencing the modified fact are immediately updated to `stale = 1`. They are not silently deleted or silently assumed correct; the UI flags them so the user knows they need re-reasoning.
-4. **Permanent Correction Audit**: A dedicated `corrections` record is stored with the exact fingerprint, previous value, corrected value, and user note.
-5. **Retrieval-Augmented Correction Memory**: Because this project runs against a free API with no model fine-tuning or weight training access, the system uses an honest in-context learning mechanism:
-   - An exact-match signature catches identical recurring mistakes for free without LLM calls.
-   - Saved corrections are indexed so that subsequent extractions and re-reasoning calls can inject past human corrections into future prompts.
-6. **Selective Re-reasoning (Redo)**: Re-running reasoning re-evaluates *only* the affected stale relationships—never re-parsing the whole document or re-extracting unaffected pages.
-
----
-
-### History — Making the System's Own Past Inspectable (Unique Addition)
-
-Rather than only showing the current end-state, every meaningful event — a document uploaded, a fact batch extracted, entities merged, a relationship classified, or a human correction applied — is recorded as an individually revisitable snapshot in an append-only `history_events` table:
-
-- **Literal Evidence Grounding**: Clicking into any past event displays the exact facts and evidence as they existed at that moment in time.
-- **Auditable Failure & Correction Sequences**: The required failure case is not a staged confession; it is visible as a real timeline sequence (an initial extraction, followed by the human correction that fixed it and the resulting stale relationship cascade).
-- **Zero Reconstruction Guesswork**: Because facts and relationships use append-only revisions with `revision` and `is_current` flags, reconstructing what the system believed at any historical point is a straightforward, reliable query rather than a fragile undo operation.
-- **Visible Incremental Growth**: As new PDFs are uploaded, new history entries record the delta without reprocessing prior documents, providing proof of true incremental knowledge accumulation.
-
----
+The timeline displays stored events for the chosen set, newest first. New comparison events include explanation, source revision IDs and reasoning mode. Correction events link old and new fact revisions. Existing events retain the information they originally recorded; old minimal snapshots do not magically contain a full past state. Deleted source data is no longer navigable. The UI loads 100 events at a time, up to 500, rather than offering an unlimited audit explorer.
 
 ### Key Engineering Decisions and Trade-offs
 
-- **SQLite Over a Graph Database**: Facts and relationships are stored in relational tables with SQLite WAL mode and foreign-key constraints. This was a deliberate choice: keeping storage in plain SQLite makes it structurally clear that reasoning happens during extraction, blocking, and comparison—storage is simply where conclusions land.
-- **Two Cheap Local Filters Before Every LLM Call**: Entity resolution (fuzzy matching) and semantic blocking (`all-MiniLM-L6-v2`) run 100% locally on CPU. This eliminates comparing thousands of unrelated facts against each other, shrinking millions of potential comparisons down to a few dozen pre-qualified pairs and preserving free-tier quota.
-- **Atomic, Restart-Safe Processing**: Work is checkpointed at the level of individual pages, fact batches, and relationship pairs. If processing is interrupted, `recover_incomplete_work()` safely resets in-flight units to `queued` on the next startup without corrupting state or losing completed work.
-- **Incremental by Construction**: New documents are matched against existing entity clusters and fact embeddings rather than triggering full recomputation.
-
----
+- **SQLite:** Embedded storage keeps setup understandable. Revisions and corrections are transactional. Two small tables persist request counts and provider cooldowns; no distributed quota infrastructure is needed.
+- **Quota control:** Calls are paced, attempted calls count toward a local daily ceiling, extraction retry counts are bounded, and relationship calls have a per-document budget. A quota failure stops stronger model claims; ambiguous pairs may be stored as insufficient evidence with a quota explanation. This is operational uncertainty, not contradictory source evidence.
+- **Checkpoints:** Individual pages, complete fact batches and comparison pairs are the units of work. A partly received model response is not a checkpoint. Cached extraction output receives current correction-memory checks before persistence in a later set.
+- **Complex documents:** Docling models are loaded only when necessary. OCR/table extraction costs CPU, disk and startup time. Model download or parsing failures remain visible and retryable.
+- **Existing data:** Completed work units and saved facts are preserved. Creating a new set with previously uploaded PDFs reuses simple-page caches but reparses old `docling_pending` pages with Docling. The earlier set's saved claims and evidence remain unchanged. There is no automatic rewrite of previously completed sets.
 
 ### AI Tools Used
 
-- **Design & Architecture Sounding Board**: Architecture decisions, trade-off analyses, and schema designs were developed through technical discussions with Claude (Anthropic), specifically evaluating entity resolution scaling, revision immutability, and deterministic arithmetic splits.
-- **Runtime Inference**: Google Gemini (`google-genai` SDK) is used exclusively at runtime for structured fact extraction and ambiguous cross-document relationship reasoning under zero temperature and structured JSON schemas.
+- This implementation and its tests/documentation were developed with OpenAI Codex assistance.
+- Earlier architecture discussions were described by the author as involving Claude; this README does not independently verify that history.
+- Runtime Gemini is used for factual extraction and ambiguous comparison, in JSON mode with local validation. No model fine-tuning is performed.
 
 ---
 
 ## Limitations and Next Steps
 
 ### Handling the Gemini Free Tier & Hardware Constraints
-- **Hardware Constraints**: This project was developed on standard laptop hardware without a dedicated high-end GPU. Running a local 8B+ reasoning LLM locally at usable speeds was not viable due to RAM/VRAM limitations, and paid cloud APIs were avoided entirely.
-- **Gemini Free-Tier Rate Limits**: The entire pipeline relies on Gemini's free API tier (with no billing enabled). Under real-world multi-page processing, free-tier requests-per-minute (RPM) and daily quotas are genuinely hit, and `429 Resource Exhausted` errors do occur during cross-document comparisons.
-- **Resilient Degradation**: Rather than crashing or aborting, the pipeline is engineered to absorb rate limits:
-  - An internal pacing lock ensures requests maintain a minimum delay.
-  - Automatic retries employ progressive exponential backoff.
-  - When cross-document reasoning quota is exhausted, ambiguous pairs degrade gracefully to `insufficient_evidence` with an honest reasoning trace explaining that provider quota was reached, while all completed facts, evidence anchors, and deterministic comparisons remain fully intact and viewable.
+
+Model access, quotas and billing vary by account. The app cannot guarantee processing hundreds of pages within a free daily allowance. A budget/cooldown error appears in stored failures; rechecking may still require waiting. There is no paid fallback. First-time local model loading can take minutes and needs network access for downloads.
 
 ### Other Known Limitations
-- **Currency & Unit Conversion**: Relies on deterministic scale conversions (`lakh`, `crore`, `million`, `billion`). Cross-currency cases with differing currencies remain uncertain unless supported by explicit contextual rates in the source text.
-- **Local Embedding Model Size**: `all-MiniLM-L6-v2` was selected for CPU speed and zero memory overhead. While fast, subtle semantic matches may occasionally score below the 0.72 threshold.
-- **Single-Worker Queue**: The job runner processes one document at a time to prevent quota spikes and memory pressure on consumer hardware.
+
+- **Charts / Gemini Vision:** No image-based Gemini chart extraction is enabled. The inspected FY24 presentation's page 9 revenue bars repeat the FY23/FY24 values in the page 17 financial table; these do not require an extra vision call for that example. No indispensable chart-only demonstration claim was established during this pass. Decorative visuals are recorded as skipped; a detected visual that may contain data is recorded in the set timeline as needing review. Genuinely image-only chart values are not supported and are never silently described as read.
+- **OCR:** Docling integration does not guarantee accurate recognition on every scan, language, rotated layout or merged table. Inspect source evidence before trusting a claim.
+- **Candidate coverage:** Similarity and fuzzy name matching can miss aliases. Candidate discovery still performs local pair comparisons before selecting the highest-scoring candidates; it is not a large-scale vector index. Entity merges can leave new candidate discovery until a later processing run.
+- **Numbers:** Numeric normalization is limited; no external FX rates or generalized accounting restatement engine. Rounding tolerances and extracted context are imperfect.
+- **Correction memory:** Matching is conservative, fuzzy retrieval searches only recent records, and incorrect human corrections can propagate to identical contexts. Memory survives set deletion because it is shared across the local workspace. There is no memory-management screen or per-user isolation.
+- **Presentation:** Facts remain individual source claims with cross-check summaries. The app does not synthesize a guaranteed single universal truth from a connected group of comparisons.
+- **Operations:** This is a local prototype, without production authentication, deployment hardening, or a proof of bug-free operation. Rechecks are synchronous HTTP requests with pacing and a daily budget; avoid repeated concurrent rechecks.
 
 ### Next Steps (Given More Time)
-- Deepen Docling OCR integration for heavily degraded scanned documents.
-- Add dynamic historical FX rate tables as a configurable context source.
-- Implement multi-document worker pools when higher-tier API quotas are available.
+
+- Add optional budgeted chart vision only for verified chart-only evidence needed by a use case.
+- Add selective migration/reprocessing for old complex-page caches and paginated history.
+- Add explicit correction-memory review/revocation and broader alias-resolution evaluations.
+- Expand OCR/scan evaluations and source-specific quantitative normalization tests.
 
 ---
 
 ## Additional Notes
 
-- **Zero Hardcoded Data**: No document names, entity aliases, page numbers, or facts from the starter PDFs are hardcoded anywhere in the pipeline. All extraction and comparison logic operates dynamically on arbitrary document inputs.
-- **Starter Datasets**: The PDFs under `starter-datasets/` (`delhivery` and `india-macroeconomy`) are provided for testing and verification; they are not application data.
-- **Lightweight Footprint**: The application intentionally avoids heavy infrastructure (no Docker requirement, no external database servers, no cloud deployment) in favor of a clean, understandable, and verifiable local architecture.
+- No starter PDF claims, entities or page numbers are hardcoded in extraction or reasoning. Mentioned pages above document a manual inspection only.
+- Starter PDFs in `starter-datasets/` are test inputs, not seeded application facts.
+- Secrets belong in the ignored `.env`; no live keys belong in this README or frontend.
+- Run checks from the root: `python -m pytest -q`. Frontend: `cd frontend` then `npm run build`.
+- Tests use isolated SQLite databases and mocked/no-network reasoning for corrections, revisions, stale state, context-sensitive memory and quota persistence. These checks do not prove that live Gemini extraction or every PDF layout is correct.

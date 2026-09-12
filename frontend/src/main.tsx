@@ -39,8 +39,9 @@ import {
   stopDocumentProcessing,
 } from "./api";
 import "./styles.css";
+import {Review, Timeline} from "./Review";
 
-type ViewName = "workspace" | "facts" | "history";
+type ViewName = "workspace" | "facts" | "history" | "comparisons" | "timeline";
 
 const stageLabel: Record<string, string> = {
   queued: "In line",
@@ -80,29 +81,55 @@ function App() {
   const [isUploading, setIsUploading] = useState(false);
   const [message, setMessage] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [syncError, setSyncError] = useState<string | null>(null);
   const [facts, setFacts] = useState<FactSummary[]>([]);
+  const [factsLoading, setFactsLoading] = useState(false);
   const [selectedFact, setSelectedFact] = useState<FactDetail | null>(null);
   const [setName, setSetName] = useState("");
+  const [refreshKey, setRefreshKey] = useState(0);
   const inputRef = useRef<HTMLInputElement>(null);
+  const selectedSetIdRef = useRef<string | null>(null);
+  const refreshRequestRef = useRef(0);
+  const factsRequestRef = useRef(0);
+
+  useEffect(() => {
+    selectedSetIdRef.current = selectedSetId;
+  }, [selectedSetId]);
 
   const refresh = async () => {
+    const requestId = ++refreshRequestRef.current;
     try {
       const nextSets = await listDocumentSets();
+      if (requestId !== refreshRequestRef.current) return;
       setSets(nextSets);
-      const nextId = selectedSetId && nextSets.some((item) => item.id === selectedSetId)
-        ? selectedSetId
+      const desiredSetId = selectedSetIdRef.current;
+      const nextId = desiredSetId && nextSets.some((item) => item.id === desiredSetId)
+        ? desiredSetId
         : nextSets[0]?.id ?? null;
       if (nextId) {
-        setSelectedSet(await getDocumentSet(nextId));
-        if (nextId !== selectedSetId) setSelectedSetId(nextId);
+        const nextSet = await getDocumentSet(nextId);
+        if (
+          requestId !== refreshRequestRef.current
+          || (selectedSetIdRef.current !== null && selectedSetIdRef.current !== nextId)
+        ) return;
+        setSelectedSet(nextSet);
+        if (nextId !== selectedSetIdRef.current) {
+          selectedSetIdRef.current = nextId;
+          setSelectedSetId(nextId);
+        }
       } else {
         setSelectedSet(null);
+        selectedSetIdRef.current = null;
+        setSelectedSetId(null);
       }
-      setError(null);
+      setSyncError(null);
+      setRefreshKey((current) => current + 1);
     } catch (requestError) {
-      setError(requestError instanceof Error ? requestError.message : "Unable to contact the API.");
+      if (requestId === refreshRequestRef.current) {
+        setSyncError(requestError instanceof Error ? requestError.message : "Unable to contact the API.");
+      }
     } finally {
-      setIsLoading(false);
+      if (requestId === refreshRequestRef.current) setIsLoading(false);
     }
   };
 
@@ -113,15 +140,23 @@ function App() {
   }, [selectedSetId]);
 
   useEffect(() => {
+    const requestId = ++factsRequestRef.current;
     const loadView = async () => {
       try {
-        if (view === "facts" && selectedSetId) setFacts(await listFacts(selectedSetId));
+        if (view !== "facts" || !selectedSetId) return;
+        setFactsLoading(true);
+        const nextFacts = await listFacts(selectedSetId);
+        if (requestId === factsRequestRef.current) setFacts(nextFacts);
       } catch (requestError) {
-        setError(requestError instanceof Error ? requestError.message : "Unable to load workspace data.");
+        if (requestId === factsRequestRef.current) {
+          setError(requestError instanceof Error ? requestError.message : "Unable to load workspace data.");
+        }
+      } finally {
+        if (requestId === factsRequestRef.current) setFactsLoading(false);
       }
     };
     if (view !== "workspace") void loadView();
-  }, [view, selectedSetId]);
+  }, [view, selectedSetId, refreshKey]);
 
   const openFact = async (factId: string) => {
     try {
@@ -142,19 +177,19 @@ function App() {
       setSelectedFact(corrected);
       setFacts((current) => [corrected, ...current.filter((fact) => fact.stable_id !== corrected.stable_id)]);
       setMessage("Your change has been saved.");
+      setRefreshKey((current) => current + 1);
     } catch (requestError) {
       setError(requestError instanceof Error ? requestError.message : "Correction could not be saved.");
     }
   };
 
-  const selectSet = async (setId: string) => {
-    try {
-      setSelectedSetId(setId);
-      setSelectedSet(await getDocumentSet(setId));
-      setError(null);
-    } catch (requestError) {
-      setError(requestError instanceof Error ? requestError.message : "We could not open this set.");
-    }
+  const selectSet = (setId: string) => {
+    refreshRequestRef.current += 1;
+    selectedSetIdRef.current = setId;
+    setSelectedSetId(setId);
+    setSelectedSet(null);
+    setIsLoading(true);
+    setError(null);
   };
 
   const retryFailedWork = async () => {
@@ -165,6 +200,7 @@ function App() {
       setSets((current) => current.map((item) => item.id === retried.id ? retried : item));
       setMessage("We’ll pick up where we left off.");
       setError(null);
+      setRefreshKey((current) => current + 1);
     } catch (requestError) {
       setError(requestError instanceof Error ? requestError.message : "We could not restart this set.");
     }
@@ -178,6 +214,7 @@ function App() {
       setSets((current) => current.map((item) => item.id === updated.id ? updated : item));
       setMessage("We’ll pause this report after its current step.");
       setError(null);
+      setRefreshKey((current) => current + 1);
     } catch (requestError) {
       setError(requestError instanceof Error ? requestError.message : "We could not pause this report.");
     }
@@ -192,6 +229,7 @@ function App() {
       setSets((current) => current.map((item) => item.id === updated.id ? updated : item));
       setMessage("Report removed from this set.");
       setError(null);
+      setRefreshKey((current) => current + 1);
     } catch (requestError) {
       setError(requestError instanceof Error ? requestError.message : "We could not remove this report.");
     }
@@ -202,11 +240,14 @@ function App() {
     try {
       await deleteDocumentSet(selectedSetId);
       setSets((current) => current.filter((item) => item.id !== selectedSetId));
+      refreshRequestRef.current += 1;
+      selectedSetIdRef.current = null;
       setSelectedSetId(null);
       setSelectedSet(null);
       setFacts([]);
       setMessage("Set deleted.");
       setError(null);
+      setRefreshKey((current) => current + 1);
     } catch (requestError) {
       setError(requestError instanceof Error ? requestError.message : "We could not delete this set.");
     }
@@ -222,6 +263,7 @@ function App() {
     setError(null);
     try {
       const response = await createDocumentSet(setName, files);
+      refreshRequestRef.current += 1;
       setSelectedSetId(response.document_set.id);
       setSelectedSet(response.document_set);
       setSets((current) => [
@@ -229,11 +271,13 @@ function App() {
         ...current.filter((item) => item.id !== response.document_set.id),
       ]);
       setSetName("");
+      selectedSetIdRef.current = response.document_set.id;
       setMessage(
         response.reused_document_count
           ? `PDF set created. ${response.reused_document_count} source file(s) reused from local cache.`
           : "Your set is ready to read.",
       );
+      setRefreshKey((current) => current + 1);
     } catch (requestError) {
       setError(requestError instanceof Error ? requestError.message : "The upload could not be completed.");
     } finally {
@@ -254,12 +298,12 @@ function App() {
   };
 
   const activeJobs = useMemo(
-    () => selectedSet?.documents.filter((member) => member.job && !["completed", "completed_with_issues"].includes(member.job.status)).length ?? 0,
+    () => selectedSet?.documents.filter((member) => member.job && ["queued", "running"].includes(member.job.status)).length ?? 0,
     [selectedSet],
   );
   const documents = selectedSet?.documents.map((member) => member.document) ?? [];
-  const readyReports = selectedSet?.documents.filter((member) => member.job?.status === "completed" || member.job?.status === "completed_with_issues").length ?? 0;
-  const reportsNeedingAttention = selectedSet?.documents.filter((member) => member.job?.status === "needs_attention" || member.job?.status === "terminal_failure").length ?? 0;
+  const readyReports = selectedSet?.documents.filter((member) => member.job?.status === "completed").length ?? 0;
+  const reportsNeedingAttention = selectedSet?.documents.filter((member) => member.job && ["needs_attention", "terminal_failure", "completed_with_issues"].includes(member.job.status)).length ?? 0;
 
   return (
     <main className="app-shell">
@@ -269,7 +313,9 @@ function App() {
         <nav aria-label="Main navigation">
           <NavItem icon={<Files />} label="My sets" active={view === "workspace"} onClick={() => setView("workspace")} />
           <NavItem icon={<FileSearch />} label="Findings" active={view === "facts"} onClick={() => setView("facts")} />
-          <NavItem icon={<History />} label="Past sets" active={view === "history"} onClick={() => setView("history")} />
+          <NavItem icon={<BadgeCheck />} label="Comparisons" active={view === "comparisons"} onClick={() => setView("comparisons")} />
+          <NavItem icon={<History />} label="History of PDFs" active={view === "history"} onClick={() => setView("history")} />
+          <NavItem icon={<Clock3 />} label="Activity & corrections" active={view === "timeline"} onClick={() => setView("timeline")} />
         </nav>
         <div className="sidebar-foot"><span className="pulse" /> Your private desk</div>
       </aside>
@@ -286,6 +332,11 @@ function App() {
           </button></div>
           <input ref={inputRef} className="sr-only" type="file" multiple accept="application/pdf,.pdf" onChange={onFileInput} />
         </header>
+
+        {view !== "workspace" && <div className="review-filter"><label>PDF set <select value={selectedSetId ?? ""} onChange={e => void selectSet(e.target.value)}><option value="" disabled>Choose a set</option>{sets.map(item => <option key={item.id} value={item.id}>{item.name}</option>)}</select></label></div>}
+        {view !== "workspace" && error && <Notice type="error" message={error} onClose={() => setError(null)} />}
+        {view !== "workspace" && syncError && <Notice type="error" message={syncError} onClose={() => setSyncError(null)} />}
+        {view !== "workspace" && message && <Notice type="success" message={message} onClose={() => setMessage(null)} />}
 
         {view === "workspace" ? (
           <>
@@ -310,6 +361,7 @@ function App() {
 
             {message && <Notice type="success" message={message} onClose={() => setMessage(null)} />}
             {error && <Notice type="error" message={error} onClose={() => setError(null)} />}
+            {syncError && <Notice type="error" message={syncError} onClose={() => setSyncError(null)} />}
 
             <section className="section-heading">
               <div><p className="eyebrow">Open set</p><h2>{selectedSet?.name ?? "Choose a set to begin"}</h2></div>
@@ -323,17 +375,18 @@ function App() {
             </section>
             <SetPicker sets={sets} selectedSetId={selectedSetId} onSelect={selectSet} />
           </>
-        ) : view === "facts" ? (
+        ) : view === "comparisons" ? <Review setId={selectedSetId} refreshKey={refreshKey} onFact={openFact} onChanged={() => setRefreshKey((current) => current + 1)} /> : view === "timeline" ? <Timeline setId={selectedSetId} refreshKey={refreshKey} onFact={openFact} /> : view === "facts" ? (
           <FactsView
             facts={facts}
             documents={documents}
+            isLoading={factsLoading}
             onOpen={openFact}
           />
         ) : (
           <HistoryView sets={sets} selectedSetId={selectedSetId} onSelect={(setId) => { void selectSet(setId); setView("workspace"); }} />
         )}
       </section>
-      {selectedFact && <FactDrawer fact={selectedFact} onClose={() => setSelectedFact(null)} onCorrect={saveCorrection} />}
+      {selectedFact && <FactDrawer key={selectedFact.id} fact={selectedFact} onClose={() => setSelectedFact(null)} onCorrect={saveCorrection} />}
     </main>
   );
 }
@@ -350,13 +403,21 @@ function DocumentCard({ document, job, onStop, onRemove }: { document: DocumentS
   const status = job?.status ?? "queued";
   const percentage = job?.progress_total ? Math.round((job.progress_current / job.progress_total) * 100) : 0;
   const isFailure = status === "needs_attention" || status === "terminal_failure";
-  const isDone = status === "completed" || status === "completed_with_issues";
-  const progressMessage = isFailure ? "This report needs a look." : isDone ? "Ready to read." : stageLabel[job?.stage ?? ""] ?? "Reading your report";
+  const hasIssues = status === "completed_with_issues";
+  const isDone = status === "completed";
+  const isFinal = isDone || hasIssues || isFailure;
+  const progressMessage = isFailure
+    ? "This report could not finish."
+    : hasIssues
+      ? "Finished with something to review."
+      : isDone
+        ? "Ready to read."
+        : stageLabel[job?.stage ?? ""] ?? "Reading your report";
   return (
     <article className="document-card">
       <div className="document-top">
-        <div className={`document-icon ${isFailure ? "danger" : isDone ? "done" : ""}`}>
-          {isFailure ? <AlertCircle /> : isDone ? <Check /> : <FileSearch />}
+        <div className={`document-icon ${isFailure ? "danger" : hasIssues ? "warning" : isDone ? "done" : ""}`}>
+          {isFailure || hasIssues ? <AlertCircle /> : isDone ? <Check /> : <FileSearch />}
         </div>
         <span className={`status-badge ${status}`}>{readableStatus(status)}</span>
       </div>
@@ -364,11 +425,12 @@ function DocumentCard({ document, job, onStop, onRemove }: { document: DocumentS
       <p>{document.page_count ? `${document.page_count} pages` : "Getting ready"} · Added {dateLabel(document.created_at)}</p>
       {job && <>
         <div className="job-description">
-          {status === "queued" && job.queue_position ? <Clock3 size={15} /> : <LoaderCircle size={15} className={isDone || isFailure ? "" : "spin"} />}
+          {status === "queued" && job.queue_position ? <Clock3 size={15} /> : <LoaderCircle size={15} className={isFinal ? "" : "spin"} />}
           <span>{status === "queued" && job.queue_position ? `${job.queue_position - 1} report${job.queue_position === 2 ? "" : "s"} ahead` : progressMessage}</span>
         </div>
-        <div className="progress-track"><div className="progress-value" style={{ width: `${isDone ? 100 : percentage}%` }} /></div>
-        <div className="card-footer"><span>{isDone ? "Ready to read" : `${percentage}% read`}</span><span>{stageLabel[job.stage] ?? job.stage}</span></div>
+        <div className="progress-track"><div className="progress-value" style={{ width: `${isFinal ? 100 : percentage}%` }} /></div>
+        <div className="card-footer"><span>{hasIssues ? "Finished with notes" : isDone ? "Ready to read" : isFailure ? "Needs attention" : `${percentage}% read`}</span><span>{stageLabel[job.stage] ?? job.stage}</span></div>
+        {(hasIssues || isFailure) && job.last_error?.message && <p className="job-error-summary">{job.last_error.message}</p>}
       </>}
       <div className="document-actions">{(status === "queued" || status === "running") && <button className="icon-button stop-button" onClick={onStop}><StopCircle size={15} /> Pause</button>}<button className="icon-button delete-document-button" onClick={onRemove}><Trash2 size={15} /> Remove</button></div>
     </article>
@@ -376,7 +438,7 @@ function DocumentCard({ document, job, onStop, onRemove }: { document: DocumentS
 }
 
 function Notice({ type, message, onClose }: { type: "success" | "error"; message: string; onClose: () => void }) {
-  return <div className={`notice ${type}`}><span>{type === "success" ? <Check size={17} /> : <AlertCircle size={17} />}</span><p>{message}</p><button onClick={onClose}>Dismiss</button></div>;
+  return <div className={`notice ${type}`} role={type === "error" ? "alert" : "status"} aria-live={type === "error" ? "assertive" : "polite"}><span>{type === "success" ? <Check size={17} /> : <AlertCircle size={17} />}</span><p>{message}</p><button onClick={onClose}>Dismiss</button></div>;
 }
 
 function LoadingCard() { return <article className="loading-card"><LoaderCircle className="spin" /><span>Connecting to your workspace…</span></article>; }
@@ -394,12 +456,12 @@ function SetPicker({ sets, selectedSetId, onSelect }: { sets: DocumentSetSummary
   </section>;
 }
 
-function FactsView({ facts, documents, onOpen }: { facts: FactSummary[]; documents: DocumentSummary[]; onOpen: (id: string) => void }) {
+function FactsView({ facts, documents, isLoading, onOpen }: { facts: FactSummary[]; documents: DocumentSummary[]; isLoading: boolean; onOpen: (id: string) => void }) {
   const nameForDocument = (id: string) => documents.find((document) => document.id === id)?.original_filename ?? "Source document";
   return <section className="data-view">
     <div className="section-heading"><div><p className="eyebrow">What your reports say</p><h2>Findings</h2></div><span className="count-pill">{facts.length} found</span></div>
     <p className="cross-check-intro">Every finding stays connected to its source. When reports speak about the same thing, you’ll see how their stories fit together.</p>
-    {facts.length === 0 ? <DataEmpty icon={<FileSearch />} title="Nothing to show yet" body="Findings will appear here after the reports have been read." /> : <div className="facts-list">
+    {isLoading && facts.length === 0 ? <LoadingCard /> : facts.length === 0 ? <DataEmpty icon={<FileSearch />} title="Nothing to show yet" body="Findings will appear here after the reports have been read." /> : <div className="facts-list">
       {facts.map((fact) => <button className="fact-row" key={fact.id} onClick={() => onOpen(fact.id)}>
         <div className="fact-confidence">{Math.round(fact.confidence * 100)}<small>%</small></div>
         <div><p className="fact-claim">{fact.claim_text}</p><span>{fact.primary_entity_mention ?? "Unnamed subject"} · {fact.time_period ?? "No date given"}</span><span className={`cross-check-badge ${fact.cross_check_status}`}>{findingLabel(fact.cross_check_status)} · {fact.cross_check_source_count} report{fact.cross_check_source_count === 1 ? "" : "s"}</span><small className="cross-check-explanation">{fact.cross_check_explanation}</small></div>
@@ -420,23 +482,38 @@ function FactDrawer({ fact, onClose, onCorrect }: { fact: FactDetail; onClose: (
   const [field, setField] = useState("normalized_value");
   const [value, setValue] = useState(fact.normalized_value ?? fact.object_value ?? "");
   const [note, setNote] = useState("");
+  const closeRef = useRef<HTMLButtonElement>(null);
+  const onCloseRef = useRef(onClose);
+  onCloseRef.current = onClose;
+  useEffect(() => {
+    const opener = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+    closeRef.current?.focus();
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") onCloseRef.current();
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => {
+      window.removeEventListener("keydown", onKeyDown);
+      opener?.focus();
+    };
+  }, []);
   const evidence = fact.evidence[0];
   const bbox = evidence?.bbox;
   const width = bbox ? Math.max(1, (bbox[2] - bbox[0]) * 100) : 0;
   const height = bbox ? Math.max(1, (bbox[3] - bbox[1]) * 100) : 0;
   return <div className="drawer-backdrop" role="presentation" onMouseDown={onClose}>
     <aside className="fact-drawer" role="dialog" aria-modal="true" aria-label="Fact evidence" onMouseDown={(event) => event.stopPropagation()}>
-      <button className="drawer-close" onClick={onClose}>Close</button>
+      <button ref={closeRef} className="drawer-close" onClick={onClose}>Close</button>
       <p className="eyebrow">Source finding</p><h2>{fact.claim_text}</h2>
       <div className="detail-grid"><Detail label="About" value={fact.subject} /><Detail label="Says" value={fact.predicate} /><Detail label="Value" value={fact.normalized_value ?? fact.object_value} /><Detail label="When" value={fact.time_period} /><Detail label="Where it applies" value={fact.scope} /></div>
       {evidence && <section className="evidence-panel"><div className="evidence-heading"><FileText size={16} /><span>Source page {evidence.page_number}</span></div><div className="page-proof"> <img src={pageRenderUrl(fact.document_id, evidence.page_number)} alt={`Source page ${evidence.page_number}`} />{bbox && <span className="evidence-highlight" style={{ left: `${bbox[0] * 100}%`, top: `${bbox[1] * 100}%`, width: `${width}%`, height: `${height}%` }} />}</div><blockquote>{evidence.quote}</blockquote></section>}
-      <section className="correction-panel"><p className="eyebrow">Make a correction</p><div className="correction-grid"><label>What would you like to change?<select value={field} onChange={(event) => setField(event.target.value)}><option value="normalized_value">Value</option><option value="raw_value">Original wording</option><option value="claim_text">Finding</option><option value="subject">Who or what it is about</option><option value="predicate">What it says</option><option value="time_period">Date or period</option><option value="scope">Where it applies</option></select></label><label>Your correction<input value={value} onChange={(event) => setValue(event.target.value)} /></label></div><label>Note (optional)<textarea value={note} onChange={(event) => setNote(event.target.value)} rows={2} /></label><button className="primary-button" onClick={() => onCorrect(field, value, note)} disabled={!value.trim()}>Save change</button></section>
+      {fact.is_current ? <section className="correction-panel"><p className="eyebrow">Make a correction</p><div className="correction-grid"><label>What would you like to change?<select value={field} onChange={(event) => setField(event.target.value)}><option value="normalized_value">Value</option><option value="raw_value">Original wording</option><option value="claim_text">Finding</option><option value="subject">Who or what it is about</option><option value="predicate">What it says</option><option value="time_period">Date or period</option><option value="scope">Where it applies</option></select></label><label>Your correction<input value={value} onChange={(event) => setValue(event.target.value)} /></label></div><label>Note (optional)<textarea value={note} onChange={(event) => setNote(event.target.value)} rows={2} /></label><button className="primary-button" onClick={() => onCorrect(field, value, note)} disabled={!value.trim()}>Save change</button></section> : <p className="stale-badge">Previous fact revision — open the current finding to make a correction.</p>}
     </aside>
   </div>;
 }
 
 function Detail({ label, value }: { label: string; value: string | null }) { return <div><span>{label}</span><strong>{value || "—"}</strong></div>; }
-function findingLabel(value: FactSummary["cross_check_status"]): string { return { corroborated: "Supported by another report", reconciled: "Different context, same story", contradicted: "Reports disagree", insufficient_evidence: "Needs more context", no_comparable_source: "Only mentioned here" }[value]; }
+function findingLabel(value: FactSummary["cross_check_status"]): string { return { stale: "Needs recheck", corroborated: "Supported by another report", reconciled: "Different context, same story", contradicted: "Reports disagree", insufficient_evidence: "Needs more context", no_comparable_source: "Only mentioned here" }[value]; }
 function DataEmpty({ icon, title, body }: { icon: ReactNode; title: string; body: string }) { return <article className="data-empty">{icon}<h3>{title}</h3><p>{body}</p></article>; }
 
 createRoot(document.getElementById("root")!).render(<App />);

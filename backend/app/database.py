@@ -227,6 +227,21 @@ class Database:
             self._ensure_column(conn, "entities", "set_id", "TEXT")
             self._ensure_column(conn, "relationships", "set_id", "TEXT")
             self._ensure_column(conn, "history_events", "set_id", "TEXT")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_correction_memory ON corrections(target_type, exact_fingerprint)")
+            conn.execute("CREATE TABLE IF NOT EXISTS provider_usage (day TEXT PRIMARY KEY, requests INTEGER NOT NULL)")
+            conn.execute("CREATE TABLE IF NOT EXISTS provider_pause (id INTEGER PRIMARY KEY, until_epoch REAL NOT NULL)")
+            # Upgrade existing fact correction records without altering their audit values.
+            from .correction_memory import fact_context, fingerprint
+            for correction in conn.execute("SELECT * FROM corrections WHERE target_type='fact' AND (semantic_context IS NULL OR semantic_context NOT LIKE '{%')").fetchall():
+                previous = conn.execute("SELECT old.* FROM facts new JOIN facts old ON old.stable_id=new.stable_id AND old.revision=new.revision-1 WHERE new.id=?", (correction["target_id"],)).fetchone()
+                if previous:
+                    payload = dict(previous)
+                    quote = conn.execute("SELECT quote FROM evidence_anchors WHERE fact_id=? LIMIT 1", (previous["id"],)).fetchone()
+                    payload["evidence_quote"] = quote[0] if quote else ""
+                    context = fact_context(payload)
+                    conn.execute("UPDATE corrections SET exact_fingerprint=?,semantic_context=? WHERE id=?", (fingerprint(context),json.dumps(context),correction["id"]))
+            conn.execute("""UPDATE history_events SET set_id=(SELECT f.set_id FROM corrections c JOIN facts f ON f.id=c.target_id WHERE c.id=history_events.related_record_id)
+                WHERE set_id IS NULL AND event_type='fact_corrected'""")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_jobs_set ON jobs(set_id, status, created_at)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_facts_set ON facts(set_id, is_current)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_relationships_set ON relationships(set_id, is_current)")
@@ -657,6 +672,10 @@ class Database:
         inserted = 0
         with self.connection() as conn:
             conn.execute("BEGIN IMMEDIATE")
+            completed = conn.execute("SELECT status FROM work_units WHERE id=?", (unit_id,)).fetchone()
+            if completed and completed["status"] == WorkUnitStatus.COMPLETED.value:
+                conn.rollback()
+                return 0
             for index, fact in enumerate(facts):
                 page_number = fact["evidence_page"]
                 page_id = page_ids.get(page_number)
@@ -871,6 +890,25 @@ class Database:
                 "cross_check_explanation": chosen["explanation"],
                 "cross_check_source_count": len(related_ids) + 1,
             }
+        with self.connection() as conn:
+            affected = conn.execute(
+                """
+                SELECT DISTINCT current.id
+                FROM relationships relationship
+                JOIN facts old ON old.id = relationship.left_fact_id
+                JOIN facts current ON current.stable_id = old.stable_id AND current.is_current = 1
+                WHERE relationship.set_id = ? AND relationship.is_current = 1 AND relationship.stale = 1
+                UNION
+                SELECT DISTINCT current.id
+                FROM relationships relationship
+                JOIN facts old ON old.id = relationship.right_fact_id
+                JOIN facts current ON current.stable_id = old.stable_id AND current.is_current = 1
+                WHERE relationship.set_id = ? AND relationship.is_current = 1 AND relationship.stale = 1
+                """,
+                (set_id, set_id),
+            ).fetchall()
+        for fact in affected:
+            summaries[fact["id"]] = {"cross_check_status": "stale", "cross_check_explanation": "A source or entity changed. Recheck its comparisons before relying on the conclusion.", "cross_check_source_count": 1}
         return summaries
 
     def fact_evidence(self, fact_id: str) -> list[dict[str, Any]]:
@@ -997,23 +1035,56 @@ class Database:
         reasoning_trace: dict[str, Any],
         entity_resolution_revision: int,
         work_unit_id: str | None = None,
+        replaces_id: str | None = None,
+        correction_note: str | None = None,
     ) -> dict[str, Any]:
         left, right = sorted([left_fact_id, right_fact_id])
         stable_id = sha256(f"{left}|{right}".encode("utf-8")).hexdigest()[:32]
         now = utc_now()
         with self.connection() as conn:
             conn.execute("BEGIN IMMEDIATE")
+            if replaces_id:
+                replaced = conn.execute(
+                    "SELECT * FROM relationships WHERE id=? AND set_id=? AND is_current=1",
+                    (replaces_id, set_id),
+                ).fetchone()
+                if not replaced:
+                    conn.rollback()
+                    raise ValueError("This comparison changed. Refresh before trying again.")
+                stable_id = replaced["stable_id"]
+                for fact_id in (left_fact_id, right_fact_id):
+                    current = conn.execute("SELECT is_current, set_id FROM facts WHERE id=?", (fact_id,)).fetchone()
+                    if not current or not current["is_current"] or current["set_id"] != set_id:
+                        conn.rollback()
+                        raise ValueError("A source changed during the recheck. Refresh and try again.")
+            else:
+                # Find the lineage by stable fact identities, including pre-upgrade rows.
+                lineage = conn.execute("""SELECT r.stable_id FROM relationships r
+                    JOIN facts l ON l.id=r.left_fact_id JOIN facts rr ON rr.id=r.right_fact_id
+                    WHERE r.set_id=? AND r.is_current=1 AND
+                    ((l.stable_id=(SELECT stable_id FROM facts WHERE id=?) AND rr.stable_id=(SELECT stable_id FROM facts WHERE id=?))
+                    OR (l.stable_id=(SELECT stable_id FROM facts WHERE id=?) AND rr.stable_id=(SELECT stable_id FROM facts WHERE id=?))) LIMIT 1""", (set_id, left_fact_id, right_fact_id, right_fact_id, left_fact_id)).fetchone()
+                if lineage:
+                    stable_id = lineage["stable_id"]
             prior = conn.execute(
                 """
                 SELECT * FROM relationships
-                WHERE stable_id = ? AND is_current = 1
+                WHERE stable_id = ? AND set_id = ? AND is_current = 1
                 ORDER BY revision DESC LIMIT 1
                 """,
-                (stable_id,),
+                (stable_id, set_id),
             ).fetchone()
             revision = (int(prior["revision"]) + 1) if prior else 1
+            if prior and not replaces_id and not prior["stale"]:
+                if work_unit_id:
+                    conn.execute("UPDATE work_units SET status='completed', updated_at=? WHERE id=?", (now, work_unit_id))
+                conn.commit()
+                return dict(prior)
             if prior:
-                conn.execute("UPDATE relationships SET is_current = 0 WHERE id = ?", (prior["id"],))
+                conn.execute(
+                    "UPDATE relationships SET is_current = 0, superseded = 1 WHERE id = ?",
+                    (prior["id"],),
+                )
             relationship_id = str(uuid.uuid4())
             conn.execute(
                 """
@@ -1040,6 +1111,12 @@ class Database:
                 ),
             )
             row = conn.execute("SELECT * FROM relationships WHERE id = ?", (relationship_id,)).fetchone()
+            if correction_note is not None and prior:
+                from .correction_memory import pair_context, fingerprint
+                left_row = dict(conn.execute("SELECT * FROM facts WHERE id=?", (left_fact_id,)).fetchone())
+                right_row = dict(conn.execute("SELECT * FROM facts WHERE id=?", (right_fact_id,)).fetchone())
+                context = pair_context(left_row, right_row)
+                conn.execute("INSERT INTO corrections (id,target_type,target_id,field_path,previous_value,corrected_value,note,exact_fingerprint,semantic_context,created_at) VALUES (?, 'relationship', ?, 'label', ?, ?, ?, ?, ?, ?)", (str(uuid.uuid4()), relationship_id, prior["label"], label, correction_note, fingerprint(context), json.dumps(context), now))
             if work_unit_id:
                 conn.execute(
                     """
@@ -1054,9 +1131,9 @@ class Database:
                 )
             self._append_history_in_connection(
                 conn,
-                "relationship_classified",
+                "relationship_corrected" if correction_note is not None else "relationship_rechecked" if replaces_id else "relationship_classified",
                 relationship_id,
-                {"set_id": set_id, "relationship_id": relationship_id, "label": label, "confidence": confidence},
+                {"set_id": set_id, "relationship_id": relationship_id, "previous_relationship_id": prior["id"] if prior else None, "left_fact_id": left_fact_id, "right_fact_id": right_fact_id, "label": label, "explanation": explanation, "confidence": confidence, "reasoning_trace": reasoning_trace},
                 set_id=set_id,
             )
             conn.commit()
@@ -1157,6 +1234,10 @@ class Database:
             values[field_path] = corrected_value
             if field_path == "predicate":
                 values["predicate_key"] = " ".join(corrected_value.casefold().split())
+            if field_path in {"subject", "primary_entity_mention"}:
+                # A renamed subject must be resolved again rather than retaining a
+                # potentially wrong entity cluster from the prior revision.
+                values["primary_entity_id"] = None
             conn.execute("UPDATE facts SET is_current = 0 WHERE id = ?", (fact_id,))
             columns = list(values)
             placeholders = ", ".join("?" for _ in columns)
@@ -1195,9 +1276,10 @@ class Database:
                 """,
                 (fact_id, fact_id),
             )
-            fingerprint = sha256(
-                f"fact|{field_path}|{previous_value}".encode("utf-8")
-            ).hexdigest()
+            from .correction_memory import fact_context, fingerprint as memory_fingerprint
+            current_dict["evidence_quote"] = evidence[0]["quote"] if evidence else ""
+            context = fact_context(current_dict)
+            fingerprint = memory_fingerprint(context)
             correction_id = str(uuid.uuid4())
             conn.execute(
                 """
@@ -1214,7 +1296,7 @@ class Database:
                     corrected_value,
                     note,
                     fingerprint,
-                    f"{field_path}: {previous_value} -> {corrected_value}. {note or ''}".strip(),
+                    json.dumps(context),
                     now,
                 ),
             )
@@ -1231,6 +1313,7 @@ class Database:
                     "corrected_value": corrected_value,
                     "note": note,
                 },
+                set_id=current_dict.get("set_id"),
             )
             result = conn.execute("SELECT * FROM facts WHERE id = ?", (new_fact_id,)).fetchone()
             conn.commit()

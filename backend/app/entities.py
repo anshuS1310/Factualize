@@ -29,7 +29,7 @@ class EntityResolver(Protocol):
 
 
 class ConservativeSimilarityResolver:
-    """High-precision fallback used while the optional Splink adapter is evaluated."""
+    """High-precision local resolver for the prototype's small entity sets."""
 
     exact_confidence = 1.0
     automatic_merge_threshold = 94.0

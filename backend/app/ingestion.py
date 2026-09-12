@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 import re
 from dataclasses import dataclass
 from pathlib import Path
@@ -10,11 +9,11 @@ import fitz
 from pydantic import BaseModel, Field
 
 from .database import Database
+from .entities import EntityResolutionService
 from .errors import DocumentProcessingError, ProcessingStopped
 from .facts import FactExtractionService
-from .entities import EntityResolutionService
 from .relationships import RelationshipService
-from .schemas import JobStatus, PipelineStage, WorkUnitStatus
+from .schemas import PipelineStage, WorkUnitStatus
 from .settings import Settings
 from .storage import LocalDocumentStorage
 
@@ -42,6 +41,7 @@ class PageArtifact(BaseModel):
     extracted_text: str
     blocks: list[PageBlock] = Field(default_factory=list)
     visuals: list[PageVisual] = Field(default_factory=list)
+    tables: list[dict[str, Any]] = Field(default_factory=list)
     metrics: dict[str, float | int | bool]
 
 
@@ -53,12 +53,7 @@ class PageTriage:
 
 
 class PdfIngestionService:
-    """Page-level PDF triage and native extraction with durable typed page artifacts.
-
-    Docling is deliberately kept behind the parser selection boundary. Its exact
-    document-level adapter is added once its installed version is verified, so a
-    guessed API cannot make the initial queue unstable.
-    """
+    """Page-level checkpoints: native simple pages, Docling OCR/layout for complex pages."""
 
     chart_caption_pattern = re.compile(
         r"\b(chart|figure|trend|growth|forecast|comparison|revenue|inflation|percent|%)\b",
@@ -80,6 +75,8 @@ class PdfIngestionService:
         self.fact_extraction = fact_extraction
         self.entity_resolution = entity_resolution
         self.relationship_service = relationship_service
+        from .complex_pdf import ComplexPageParser
+        self.complex_parser = ComplexPageParser(settings.docling_models_dir)
 
     def process(self, job_id: str) -> None:
         job = self.database.get_job(job_id)
@@ -131,7 +128,9 @@ class PdfIngestionService:
                     unit_key=f"page:{document['sha256']}:{page_number}:v1:set:{set_id}",
                     max_attempts=self.settings.gemini_max_automatic_attempts,
                 )
-                if unit["status"] == WorkUnitStatus.COMPLETED.value:
+                cached_page = existing_pages.get(page_number)
+                needs_docling_upgrade = self._needs_docling_upgrade(cached_page)
+                if unit["status"] == WorkUnitStatus.COMPLETED.value and not needs_docling_upgrade:
                     self.database.update_job(
                         job_id,
                         progress_current=page_number,
@@ -139,10 +138,10 @@ class PdfIngestionService:
                         progress_detail=f"Reused cached page {page_number} of {page_count}",
                     )
                     continue
-                cached_page = existing_pages.get(page_number)
                 if (
                     cached_page
                     and cached_page["status"] == "completed"
+                    and not needs_docling_upgrade
                     and cached_page["cache_path"]
                     and Path(cached_page["cache_path"]).is_file()
                 ):
@@ -296,9 +295,12 @@ class PdfIngestionService:
         blocks = self._text_blocks(page)
         visuals = self._visuals(page, raw_text)
         triage = self._triage(page, raw_text, blocks, visuals)
-        # The initial native parser is reliable for simple pages. Complex pages retain
-        # their triage signal and will route through the Docling adapter next.
-        parser = "pymupdf_native" if triage.parser == "pymupdf4llm" else "docling_pending"
+        parser = "pymupdf_native"
+        tables = []
+        if triage.result == "complex":
+            raw_text, structured_blocks, tables = self.complex_parser.convert(page)
+            blocks = [PageBlock(**block) for block in structured_blocks]
+            parser = "docling"
         return PageArtifact(
             page_number=page.number + 1,
             page_width=page.rect.width,
@@ -308,7 +310,23 @@ class PdfIngestionService:
             extracted_text=raw_text,
             blocks=blocks,
             visuals=visuals,
+            tables=tables,
             metrics=triage.metrics,
+        )
+
+    @staticmethod
+    def _needs_docling_upgrade(cached_page: dict[str, Any] | None) -> bool:
+        """Identify a legacy page that was explicitly deferred for Docling.
+
+        A completed work unit normally means its cache is safe to reuse.  The
+        explicit ``docling_pending`` marker is the exception: it records that
+        native text was only a temporary representation, so a later retry must
+        run the complex parser rather than skip the page checkpoint.
+        """
+        return bool(
+            cached_page
+            and cached_page.get("status") == "completed"
+            and cached_page.get("parser_used") == "docling_pending"
         )
 
     @staticmethod
@@ -351,14 +369,14 @@ class PdfIngestionService:
             for visual in visuals
         )
         text_density = len(raw_text) / (page_area / 1000)
-        x_starts = {round(block.bbox[0] / max(page.rect.width, 1), 1) for block in blocks}
-        likely_multi_column = len(blocks) >= 8 and len(x_starts) >= 3
+        likely_multi_column = PdfIngestionService._likely_multi_column(page, blocks)
         image_ratio = min(1.0, visual_area / page_area)
         is_complex = (
             len(raw_text) < 80
             or image_ratio >= 0.25
             or likely_multi_column
             or len(visuals) >= 3
+            or bool(page.find_tables().tables)
         )
         metrics: dict[str, float | int | bool] = {
             "text_characters": len(raw_text),
@@ -370,7 +388,26 @@ class PdfIngestionService:
         }
         if is_complex:
             return PageTriage("complex", "docling", metrics)
-        return PageTriage("simple", "pymupdf4llm", metrics)
+        return PageTriage("simple", "pymupdf_native", metrics)
+
+    @staticmethod
+    def _likely_multi_column(page: fitz.Page, blocks: list[PageBlock]) -> bool:
+        """Detect actual parallel text columns without flagging ordinary indents.
+
+        A heading, a caption and a few indented paragraphs can have many distinct
+        x-coordinates in a normal one-column annual report.  Require several
+        substantial, narrow body blocks in both independent column regions before
+        paying the OCR/layout cost for the page.
+        """
+        width = max(page.rect.width, 1)
+        body_blocks = [
+            block
+            for block in blocks
+            if len(block.text) >= 80 and (block.bbox[2] - block.bbox[0]) <= width * 0.58
+        ]
+        left_column = [block for block in body_blocks if block.bbox[0] <= width * 0.38]
+        right_column = [block for block in body_blocks if block.bbox[0] >= width * 0.48]
+        return len(left_column) >= 3 and len(right_column) >= 3
 
     def _register_skipped_visual_units(
         self,
@@ -383,8 +420,6 @@ class PdfIngestionService:
         visuals: list[PageVisual],
     ) -> None:
         for visual in visuals:
-            if visual.data_bearing_candidate:
-                continue
             unit = self.database.create_work_unit(
                 job_id=job_id,
                 document_id=document_id,
@@ -393,16 +428,33 @@ class PdfIngestionService:
                 max_attempts=self.settings.gemini_max_automatic_attempts,
             )
             if unit["status"] == WorkUnitStatus.QUEUED.value:
+                skip_reason = (
+                    "image_data_review_not_enabled"
+                    if visual.data_bearing_candidate
+                    else "non_data_visual"
+                )
+                progress_detail = (
+                    "A visual may contain data, but image-only chart reading is not enabled."
+                    if visual.data_bearing_candidate
+                    else "Visual was classified as decorative or non-data-bearing."
+                )
                 self.database.update_work_unit(
                     unit["id"],
                     status=WorkUnitStatus.SKIPPED,
-                    skip_reason="non_data_visual",
-                    progress_detail="Visual was classified as decorative or non-data-bearing.",
+                    skip_reason=skip_reason,
+                    progress_detail=progress_detail,
                 )
                 self.database.append_history(
-                    "visual_skipped",
+                    "visual_needs_review" if visual.data_bearing_candidate else "visual_skipped",
                     unit["id"],
-                    {"page_number": page_number, "reason": "non_data_visual"},
+                    {
+                        "page_number": page_number,
+                        "reason": (
+                            "A visual may contain data that has not been read."
+                            if visual.data_bearing_candidate
+                            else "Decorative visual"
+                        ),
+                    },
                     set_id=set_id,
                 )
 

@@ -1,14 +1,14 @@
 from __future__ import annotations
 
-import json
 import math
 import re
 from dataclasses import dataclass
 from typing import Any
 
 import numpy as np
-from sentence_transformers import SentenceTransformer
+from rapidfuzz import fuzz
 
+from .correction_memory import CorrectionMemory, pair_context
 from .database import Database, parse_json
 from .errors import ProcessingStopped
 from .gemini import GeminiConfigurationError, GeminiGateway, GeminiRelationshipError
@@ -21,6 +21,7 @@ class CandidatePair:
     left: dict[str, Any]
     right: dict[str, Any]
     similarity: float
+    matching_mode: str
 
 
 class LocalEmbeddingService:
@@ -30,13 +31,15 @@ class LocalEmbeddingService:
 
     def __init__(self, database: Database) -> None:
         self.database = database
-        self._model: SentenceTransformer | None = None
+        self._model: Any = None
+        self._unavailable_reason: str | None = None
 
     def embedding_for_fact(self, fact: dict[str, Any]) -> np.ndarray:
         existing = parse_json(fact.get("embedding_json"), None)
         if existing:
             return np.asarray(existing, dtype=np.float32)
         if self._model is None:
+            from sentence_transformers import SentenceTransformer
             self._model = SentenceTransformer(self.model_name)
         claim = " | ".join(
             part
@@ -51,6 +54,33 @@ class LocalEmbeddingService:
         serializable = np.asarray(embedding, dtype=np.float32).tolist()
         self.database.update_fact_embedding(fact["id"], serializable)
         return np.asarray(serializable, dtype=np.float32)
+
+    def similarity(self, left: dict[str, Any], right: dict[str, Any]) -> tuple[float, str]:
+        """Return a local candidate score without making processing depend on a model download.
+
+        The sentence-transformer is preferred and remains the normal path.  If a
+        first-run model download or a local runtime fails, lexical overlap is a
+        deliberately conservative alternative: it only decides which pairs are
+        worth reviewing, never the truth of a fact or relationship.
+        """
+        if self._unavailable_reason is None:
+            try:
+                left_embedding = self.embedding_for_fact(left)
+                right_embedding = self.embedding_for_fact(right)
+                return float(np.dot(left_embedding, right_embedding)), "sentence_transformer"
+            except Exception as error:  # Candidate discovery remains available offline.
+                self._unavailable_reason = f"{type(error).__name__}: {error}"
+        return self._lexical_similarity(left, right), "local_lexical_fallback"
+
+    @staticmethod
+    def _lexical_similarity(left: dict[str, Any], right: dict[str, Any]) -> float:
+        def material(fact: dict[str, Any]) -> str:
+            return " ".join(
+                str(fact.get(field) or "")
+                for field in ("subject", "predicate", "claim_text")
+            ).strip()
+
+        return fuzz.token_set_ratio(material(left), material(right)) / 100
 
 
 class DeterministicComparator:
@@ -77,15 +107,19 @@ class DeterministicComparator:
             "same_scope": same_scope,
             "same_unit": same_unit,
         }
+        # Similar embeddings do not establish the same metric. Missing contexts
+        # and merely different periods are not proof of reconciliation.
+        if not all(left.get(key) and right.get(key) for key in ("subject", "predicate", "time_period", "scope", "unit_or_currency")):
+            return None, context
+        if self._norm(left.get("subject")) != self._norm(right.get("subject")):
+            return None, context
+        if self._norm(left.get("predicate")) != self._norm(right.get("predicate")) or not same_period or not same_scope:
+            return None, context
         if left_value is not None and right_value is not None and same_unit:
             tolerance = max(abs(left_value), abs(right_value), 1) * 0.005
             if math.isclose(left_value, right_value, abs_tol=tolerance):
                 return RelationshipLabel.CORROBORATES, context
-            if not same_period or not same_scope:
-                return RelationshipLabel.RECONCILED, context
             return RelationshipLabel.CONTRADICTS, context
-        if not same_period or not same_scope:
-            context["context_mismatch"] = True
         return None, context
 
     def _numeric_value(self, fact: dict[str, Any]) -> float | None:
@@ -158,9 +192,19 @@ class RelationshipService:
                 left = {**candidate.left, "evidence": self.database.fact_evidence(candidate.left["id"])}
                 right = {**candidate.right, "evidence": self.database.fact_evidence(candidate.right["id"])}
                 decision, context = self.comparator.compare(left, right)
-                trace: dict[str, Any] = {"similarity": candidate.similarity, "mode": "deterministic"}
+                trace: dict[str, Any] = {
+                    "similarity": candidate.similarity,
+                    "candidate_matching_mode": candidate.matching_mode,
+                    "mode": "deterministic",
+                }
+                memories = CorrectionMemory(self.database).retrieve("relationship", pair_context(left, right), exact=True)
                 try:
-                    if decision is None and (
+                    if memories:
+                        decision = RelationshipLabel(memories[0]["after"])
+                        explanation = memories[0]["reason"] or "Reused a human correction for an exactly matching fact pair."
+                        confidence = 1.0
+                        trace = {"mode": "correction_memory", "correction_id": memories[0]["id"]}
+                    elif decision is None and (
                         quota_exhausted
                         or gemini_calls >= self.settings.relationship_gemini_call_budget
                     ):
@@ -171,7 +215,12 @@ class RelationshipService:
                             f"{reason}; no stronger conclusion is claimed."
                         )
                         confidence = 0.65
-                        trace = {"similarity": candidate.similarity, "mode": "local_safe_fallback", "reason": reason}
+                        trace = {
+                            "similarity": candidate.similarity,
+                            "candidate_matching_mode": candidate.matching_mode,
+                            "mode": "local_safe_fallback",
+                            "reason": reason,
+                        }
                     elif decision is None:
                         try:
                             gemini_calls += 1
@@ -181,6 +230,7 @@ class RelationshipService:
                             confidence = decision_data.confidence
                             trace = {
                                 "similarity": candidate.similarity,
+                                "candidate_matching_mode": candidate.matching_mode,
                                 "mode": "gemini",
                                 "model": decision_data.model,
                             }
@@ -194,7 +244,12 @@ class RelationshipService:
                                 "model quota is unavailable; no stronger conclusion is claimed."
                             )
                             confidence = 0.65
-                            trace = {"similarity": candidate.similarity, "mode": "local_safe_fallback", "reason": "provider quota exhausted"}
+                            trace = {
+                                "similarity": candidate.similarity,
+                                "candidate_matching_mode": candidate.matching_mode,
+                                "mode": "local_safe_fallback",
+                                "reason": "provider quota exhausted",
+                            }
                     else:
                         explanation = self._deterministic_explanation(decision, context)
                         confidence = 0.97 if decision == RelationshipLabel.CORROBORATES else 0.9
@@ -222,6 +277,7 @@ class RelationshipService:
                         "relationship_classification_failed",
                         unit["id"],
                         {"left_fact_id": left["id"], "right_fact_id": right["id"], "message": str(error)},
+                        set_id=set_id,
                     )
         report = {"candidates": candidate_count, "relationships": created}
         self.database.append_history("relationship_comparison_completed", document_id, report, set_id=set_id)
@@ -230,7 +286,49 @@ class RelationshipService:
     @staticmethod
     def _is_quota_error(error: RuntimeError) -> bool:
         message = str(error).casefold()
-        return "resource_exhausted" in message or "quota exceeded" in message or " 429" in message
+        return "resource_exhausted" in message or "quota" in message or " 429" in message
+
+    def revise(self, relationship_id: str, *, label: str | None = None, note: str | None = None):
+        with self.database.connection() as conn:
+            stored = conn.execute("SELECT * FROM relationships WHERE id=? AND is_current=1", (relationship_id,)).fetchone()
+            if not stored:
+                raise KeyError("Current comparison not found")
+            old = dict(stored)
+            facts = []
+            for key in ("left_fact_id", "right_fact_id"):
+                row = conn.execute("SELECT new.* FROM facts old JOIN facts new ON old.stable_id=new.stable_id WHERE old.id=? AND new.is_current=1", (old[key],)).fetchone()
+                if not row:
+                    raise ValueError("A source fact is no longer available.")
+                facts.append(dict(row))
+        left, right = facts
+        for fact in facts:
+            fact["evidence"] = self.database.fact_evidence(fact["id"])
+        decision, context = self.comparator.compare(left, right)
+        memories = CorrectionMemory(self.database).retrieve("relationship", pair_context(left, right), exact=True)
+        trace = {"mode": "deterministic"}
+        confidence = 0.9
+        if label is not None:
+            if old["stale"]:
+                raise ValueError("Recheck the changed sources before correcting this conclusion.")
+            decision = RelationshipLabel(label)
+            explanation = note or "Human reviewed this conclusion."
+            trace = {"mode": "human_correction"}
+            confidence = 1.0
+        elif memories:
+            decision = RelationshipLabel(memories[0]["after"])
+            explanation = memories[0]["reason"] or "Exact prior human correction."
+            trace = {"mode": "correction_memory", "correction_id": memories[0]["id"]}
+        elif decision is None:
+            try:
+                result = self.gateway.classify_relationship(left, right, context)
+                decision, explanation, confidence = result.label, result.explanation, result.confidence
+                trace = {"mode": "gemini", "model": result.model}
+            except RuntimeError as error:
+                self.database.append_history("relationship_recheck_failed", relationship_id, {"message": str(error), "relationship_id": relationship_id}, set_id=old["set_id"])
+                raise
+        else:
+            explanation = self._deterministic_explanation(decision, context)
+        return self.database.persist_relationship(left_fact_id=left["id"], right_fact_id=right["id"], set_id=old["set_id"], label=decision.value, explanation=explanation, confidence=confidence, deterministic_context=context, reasoning_trace=trace, entity_resolution_revision=old["entity_resolution_revision"], replaces_id=relationship_id, correction_note=note if label is not None else None)
 
     @staticmethod
     def _candidate_key(candidate: CandidatePair, entity_revision: int) -> str:
@@ -245,11 +343,9 @@ class RelationshipService:
                     continue
                 if left["document_id"] != new_document_id and right["document_id"] != new_document_id:
                     continue
-                left_embedding = self.embedder.embedding_for_fact(left)
-                right_embedding = self.embedder.embedding_for_fact(right)
-                similarity = float(np.dot(left_embedding, right_embedding))
+                similarity, matching_mode = self.embedder.similarity(left, right)
                 if similarity >= self.similarity_threshold:
-                    pairs.append(CandidatePair(left, right, similarity))
+                    pairs.append(CandidatePair(left, right, similarity, matching_mode))
         return sorted(pairs, key=lambda candidate: candidate.similarity, reverse=True)
 
     @staticmethod
